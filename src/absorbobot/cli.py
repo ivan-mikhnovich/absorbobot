@@ -84,6 +84,7 @@ def render_units(settings: Settings, *, uv_binary: str | Path | None = None) -> 
     api_state = settings.state_dir / "telegram-api"
     api_workdir = str(api_state).replace("%", "%%")
     bot_workdir = str(settings.state_dir).replace("%", "%%")
+    secrets_path = str(settings.secrets_file).replace("%", "%%")
     native = _exec([
         settings.api_binary, "--local", f"--http-ip-address={urlsplit(settings.bot_api_url).hostname}", "--http-port=8081",
         f"--dir={api_state}", f"--files-dir={settings.storage_dir / 'telegram-api-files'}",
@@ -91,7 +92,7 @@ def render_units(settings: Settings, *, uv_binary: str | Path | None = None) -> 
     ])
     bot = _exec([uv, "tool", "run", "--offline", "--no-config", "absorbobot", "serve", "--config", settings.config_path])
     common = (
-        f"EnvironmentFile={_quoted(settings.secrets_file)}\n"
+        f"EnvironmentFile={secrets_path}\n"
         f"ExecStartPre={pre}\n"
         "UMask=0077\nKillMode=control-group\nTimeoutStopSec=15s\nRestart=on-failure\n"
     )

@@ -164,3 +164,4 @@ def test_generated_units_are_accepted_by_systemd_with_space_and_percent_paths(se
         [analyzer, "--user", "verify", str(tmp_path / "absorbobot.service"),
          str(tmp_path / "absorbobot-api.service")], capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
+    assert result.stderr == ""
