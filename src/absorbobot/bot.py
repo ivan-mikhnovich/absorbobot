@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import signal
-from datetime import timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from aiogram import Bot
@@ -21,7 +22,7 @@ from absorbobot.admin import Admin
 from absorbobot.config import Settings, probe_core
 from absorbobot.dialog import Dialog
 from absorbobot.i18n import language_for
-from absorbobot.store import Store, utc_now
+from absorbobot.store import Store, _utc, utc_now
 
 
 class UpdateRouter:
@@ -62,15 +63,99 @@ class TelegramOutbox:
 
     METHODS = frozenset({"send_message", "send_photo", "send_document",
                          "edit_message_text", "answer_callback_query"})
+    PROGRESS_INTERVAL = timedelta(seconds=5)
 
     def __init__(self, bot: Bot, store: Store):
         self.bot, self.store = bot, store
 
+    def _fresh_payload(self, item_id: int) -> dict | None:
+        """Прочитать payload из базы: продюсер прогресса дописывает текст до отправки."""
+        row = self.store.db.execute("SELECT status,payload FROM outbox WHERE id=?", (item_id,)).fetchone()
+        if row is None or row["status"] != "pending":
+            return None
+        return json.loads(row["payload"])
+
+    def _progress_state(self, work_uuid: str) -> dict:
+        """Действия прогресса одного задания: ожидающие, время отправки и корневое сообщение."""
+        rows = self.store.db.execute(
+            "SELECT id,status,sent_at,payload,result FROM outbox WHERE kind='telegram' "
+            "AND json_extract(payload,'$.purpose')='progress' "
+            "AND json_extract(payload,'$.work_uuid')=? ORDER BY id",
+            (work_uuid,),
+        ).fetchall()
+        pending, last_sent_at, message_id = [], None, None
+        for row in rows:
+            payload = json.loads(row["payload"])
+            if row["status"] == "pending":
+                pending.append({"id": row["id"], "payload": payload})
+                continue
+            result = json.loads(row["result"]) if row["result"] else {}
+            if result.get("progress") and row["sent_at"]:
+                last_sent_at = row["sent_at"]
+            if payload.get("method") == "send_message" and result.get("message_id"):
+                message_id = result["message_id"]
+        return {"pending": pending, "last_sent_at": last_sent_at, "message_id": message_id}
+
+    def _supersede(self, pending: list[dict], representative: int) -> None:
+        """Устаревшие правки одного прогресса завершить как пропущенные, не отправляя их."""
+        for row in pending:
+            if row["id"] != representative:
+                self.store.outbox_sent(row["id"], {"skipped": "superseded", "superseded_by": representative})
+
+    async def _send_progress(self, item: dict, payload: dict) -> None:
+        item_id, owner = item["id"], payload["owner_id"]
+        work_uuid = payload["work_uuid"]
+        job = self.store.get_job(work_uuid)
+        if not job or job["owner_id"] != owner:
+            # Прогресс не должен уходить чужому владельцу или несуществующему заданию.
+            self.store.outbox_sent(item_id, {"skipped": "owner_mismatch"})
+            return
+        state = self._progress_state(work_uuid)
+        pending = state["pending"]
+        if not pending:
+            return
+        root = next((row for row in reversed(pending) if row["payload"].get("method") == "send_message"), None)
+        # Корневое сообщение остаётся единственным: пока нет message_id отправляем именно его.
+        representative = root["id"] if state["message_id"] is None and root else pending[-1]["id"]
+        if item_id != representative:
+            self.store.outbox_sent(item_id, {"skipped": "superseded", "superseded_by": representative})
+            return
+        self._supersede(pending, representative)
+        text = pending[-1]["payload"]["kwargs"]["text"]
+        method = payload["method"]
+        if method == "send_message" and state["message_id"] is not None:
+            # Корневое сообщение уже отправлено, повторная отправка создала бы второе.
+            method = "edit_message_text"
+        if method == "edit_message_text":
+            if state["message_id"] is None:
+                self.store.outbox_sent(item_id, {"skipped": "missing_message"})
+                return
+            kwargs = {"chat_id": owner, "message_id": state["message_id"], "text": text}
+        else:
+            kwargs = dict(payload["kwargs"])
+            kwargs["text"] = text
+            if "chat_id" in kwargs and kwargs["chat_id"] != owner:
+                raise ValueError("Outbox recipient does not match owner.")
+        if state["last_sent_at"] is not None:
+            deadline = datetime.fromisoformat(state["last_sent_at"]) + self.PROGRESS_INTERVAL
+            if utc_now() < deadline:
+                # Сдвигаем только срок: попытки не тратятся, сетевые задержки не укорачиваются.
+                with self.store.transaction():
+                    self.store.db.execute("UPDATE outbox SET available_at=? WHERE id=? AND status='pending'",
+                                          (_utc(deadline), item_id))
+                return
+        await self._dispatch(item, method, kwargs, extra={"progress": True})
+
     async def send(self, item: dict) -> None:
-        payload = item["payload"]
+        payload = self._fresh_payload(item["id"])
+        if payload is None:
+            return
         owner = payload["owner_id"]
         if not self.store.authorized(owner) and payload.get("purpose") != "cancellation":
             self.store.outbox_sent(item["id"], {"skipped": "access_revoked"})
+            return
+        if payload.get("purpose") == "progress":
+            await self._send_progress(item, payload)
             return
         method = payload["method"]
         if method not in self.METHODS:
@@ -82,11 +167,22 @@ class TelegramOutbox:
             kwargs["photo"] = FSInputFile(Path(__file__).with_name("assets") / "absorbent.jpg")
         if method == "send_document" and "file" in payload:
             # Только заранее подготовленный собственный файл, не произвольный путь update.
-            root = (self.store.settings.storage_dir / "jobs" / payload["work_uuid"]).resolve()
+            source = self.store.get_job(payload["work_uuid"])
+            if (not source or source["status"] != "completed" or source["files_deleted"]
+                    or not self.store.authorized(source["owner_id"])):
+                self.store.outbox_sent(item["id"], {"skipped": "source_unavailable"})
+                return
+            base = (self.store.settings.storage_dir / "jobs").resolve()
+            root = base / source["id"]
             path = (root / payload["file"]).resolve()
-            if not path.is_relative_to(root) or not path.is_file():
-                raise ValueError("Delivery file is outside its work tree or missing.")
+            if (root.is_symlink() or not root.resolve().is_relative_to(base)
+                    or not path.is_relative_to(root) or not path.is_file()):
+                self.store.outbox_sent(item["id"], {"skipped": "artifact_missing"})
+                return
             kwargs["document"] = FSInputFile(path, filename=payload.get("filename", path.name))
+        await self._dispatch(item, method, kwargs)
+
+    async def _dispatch(self, item: dict, method: str, kwargs: dict, *, extra: dict | None = None) -> None:
         try:
             response = await getattr(self.bot, method)(**kwargs)
         except TelegramRetryAfter as exc:
@@ -102,6 +198,8 @@ class TelegramOutbox:
                 self.store.outbox_retry(item["id"], utc_now() + timedelta(seconds=300), type(exc).__name__)
         else:
             result = {"message_id": response.message_id} if hasattr(response, "message_id") else {"ok": bool(response)}
+            if extra:
+                result.update(extra)
             self.store.outbox_sent(item["id"], result)
 
     async def run(self, stop: asyncio.Event) -> None:
