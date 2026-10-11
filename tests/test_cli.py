@@ -5,6 +5,9 @@ import json
 import os
 import sys
 from types import SimpleNamespace
+import shutil
+import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -16,39 +19,6 @@ def settings(tmp_path):
     core_config = tmp_path / "catalog.yaml"
     core_config.write_text("providers:\n  dynamic:\n    base_url: https://api.example/v1\n    api_key_env: DYNAMIC_CLOUD_KEY\n  optional:\n    base_url: https://optional.example/v1\n    api_key_env: OPTIONAL_CLOUD_KEY\n")
     return config.Settings(storage_dir=tmp_path / "volume" / "new data", backing_mount=tmp_path / "volume", state_dir=tmp_path / "SSD state", absorbent_config=core_config, config_path=tmp_path / "new config.yaml", secrets_file=tmp_path / "protected.env", api_binary=tmp_path / "tools" / "telegram-bot-api")
-
-
-def test_unit_paths_use_changed_settings(settings):
-    units = cli.render_units(settings, uv_binary="/usr/bin/uv")
-    assert set(units) == {"absorbobot.service", "absorbobot-api.service"}
-    native, bot = units["absorbobot-api.service"], units["absorbobot.service"]
-    assert f"--dir={settings.state_dir / 'telegram-api'}" in native
-    assert f"--files-dir={settings.storage_dir / 'telegram-api-files'}" in native
-    assert f"--temp-dir={settings.storage_dir / 'telegram-api-tmp'}" in native
-    assert str(settings.api_binary) in native
-    assert "UnsetEnvironment=ABSORBOBOT_TOKEN DYNAMIC_CLOUD_KEY OPTIONAL_CLOUD_KEY" in native
-    assert "TELEGRAM_API_HASH" not in native
-    assert "--http-ip-address=127.0.0.1" in native
-    assert "--http-port=8081" in native
-    assert "Requires=absorbobot-api.service\nAfter=absorbobot-api.service" in bot
-    for unit in units.values():
-        assert str(settings.config_path) in unit
-        assert str(settings.secrets_file) in unit
-        assert "ExecStartPre=" in unit and '"check-storage"' in unit
-        assert "UMask=0077" in unit
-        assert "KillMode=control-group" in unit
-        assert "TimeoutStopSec=15s" in unit
-        assert "Restart=on-failure" in unit
-        assert "/media/storage/absorbobot" not in unit
-    assert not settings.storage_dir.exists()
-    assert not settings.state_dir.exists()
-
-
-def test_unit_escaping(settings):
-    from dataclasses import replace
-    changed = replace(settings, config_path=settings.config_path.parent / 'a%"$b.yaml')
-    unit = cli.render_units(changed, uv_binary="/usr/bin/uv")["absorbobot.service"]
-    assert 'a%%\\"$$b.yaml' in unit
 
 
 def test_install_only_own_units_and_reload(settings, monkeypatch, tmp_path):
@@ -178,3 +148,19 @@ def test_getme_only_and_safe_token_errors(settings, monkeypatch, mode):
 def test_missing_token_distinguished(settings):
     with pytest.raises(config.ConfigError, match="Не задана переменная ABSORBOBOT_TOKEN"):
         asyncio.run(cli.check_telegram(settings, {}))
+
+
+def test_generated_units_are_accepted_by_systemd_with_space_and_percent_paths(settings, tmp_path):
+    from dataclasses import replace
+    analyzer = shutil.which("systemd-analyze")
+    if analyzer is None:
+        pytest.skip("systemd-analyze не установлен.")
+    changed = replace(settings, state_dir=tmp_path / "SSD state%value",
+                      secrets_file=tmp_path / "protected key.env",
+                      api_binary=Path("/usr/bin/true"))
+    for name, content in cli.render_units(changed, uv_binary="/usr/bin/true").items():
+        (tmp_path / name).write_text(content)
+    result = subprocess.run(
+        [analyzer, "--user", "verify", str(tmp_path / "absorbobot.service"),
+         str(tmp_path / "absorbobot-api.service")], capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr

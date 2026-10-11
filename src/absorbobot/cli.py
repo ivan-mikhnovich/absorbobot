@@ -82,6 +82,8 @@ def render_units(settings: Settings, *, uv_binary: str | Path | None = None) -> 
                 raise ConfigError("Некорректное имя cloud API-ключа для native unit.")
             unset.add(name)
     api_state = settings.state_dir / "telegram-api"
+    api_workdir = str(api_state).replace("%", "%%")
+    bot_workdir = str(settings.state_dir).replace("%", "%%")
     native = _exec([
         settings.api_binary, "--local", f"--http-ip-address={urlsplit(settings.bot_api_url).hostname}", "--http-port=8081",
         f"--dir={api_state}", f"--files-dir={settings.storage_dir / 'telegram-api-files'}",
@@ -96,12 +98,12 @@ def render_units(settings: Settings, *, uv_binary: str | Path | None = None) -> 
     return {
         "absorbobot-api.service": (
             "[Unit]\nDescription=Absorbobot local Telegram Bot API\n\n[Service]\nType=simple\n"
-            f"WorkingDirectory={_quoted(api_state)}\n{common}"
+            f"WorkingDirectory={api_workdir}\n{common}"
             f"UnsetEnvironment={' '.join(sorted(unset))}\nExecStart={native}\n\n[Install]\nWantedBy=default.target\n"
         ),
         "absorbobot.service": (
             "[Unit]\nDescription=Absorbobot\nRequires=absorbobot-api.service\nAfter=absorbobot-api.service\n\n"
-            f"[Service]\nType=simple\nWorkingDirectory={_quoted(settings.state_dir)}\n{common}"
+            f"[Service]\nType=simple\nWorkingDirectory={bot_workdir}\n{common}"
             f"ExecStart={bot}\n\n[Install]\nWantedBy=default.target\n"
         ),
     }
