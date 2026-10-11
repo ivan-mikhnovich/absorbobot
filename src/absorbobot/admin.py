@@ -275,9 +275,10 @@ class Admin:
         text = [self._t(actor, "stats_title", owner=owner if owner is not None else self._t(actor, "everyone")), self._t(actor, "stats_counts", jobs=stats["jobs"], deliveries=stats["deliveries"], reused=stats["reused_deliveries"], attempts=stats["api_attempts"])]
         for status, count in stats["statuses"].items():
             text.append(f"{self._status(actor, status)}: {count}")
-        for field in ("cpu_user_seconds", "cpu_system_seconds", "busy_gpu_seconds", "queue_wait_seconds", "preparation_seconds", "processing_seconds", "render_seconds", "delivery_seconds", "prompt_tokens", "completion_tokens", "cache_hit", "cache_miss", "reasoning_tokens"):
+        for field in ("cpu_user_seconds", "cpu_system_seconds", "busy_gpu_seconds", "ru_maxrss_kib", "host_rss_peak_kib", "vram_peak_bytes", "queue_wait_seconds", "preparation_seconds", "processing_seconds", "render_seconds", "delivery_seconds", "prompt_tokens", "completion_tokens", "cache_hit", "cache_miss", "reasoning_tokens"):
             value = stats[field]
-            text.append(self._t(actor, "measurement", label=self._t(actor, "metric_" + field), value=self._value(actor, value["known_total"]), unknown=value.get("unknown_jobs", value.get("unknown_calls", 0))))
+            measurement = value.get("known_total", value.get("known_peak"))
+            text.append(self._t(actor, "measurement", label=self._t(actor, "metric_" + field), value=self._value(actor, measurement), unknown=value.get("unknown_works", value.get("unknown_calls", value.get("unknown_deliveries", 0)))))
         cost = stats["estimated_api_cost"]
         totals = ", ".join(f"{amount} {currency}" for currency, amount in cost["known_totals"].items()) or self._t(actor, "unknown")
         text.append(self._t(actor, "cost_notice", known=totals, incomplete=cost["incomplete_calls"]))

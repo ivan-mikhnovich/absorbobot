@@ -33,7 +33,7 @@ JOB_TRANSITIONS = {
 }
 DRAFT_TRANSITIONS = {
     "collecting": {"preparing", "ready", "closed", "failed"},
-    "preparing": {"ready", "closed", "failed"},
+    "preparing": {"collecting", "ready", "closed", "failed"},
     "ready": {"collecting", "preparing", "submitted", "closed", "failed", "deleted"},
     "closed": {"deleted"},
     "failed": {"deleted"},
@@ -223,6 +223,40 @@ def _uuid(value: str) -> str:
             raise ValueError
     except (ValueError, TypeError, AttributeError) as exc:
         raise StoreError("invalid_work_uuid") from exc
+    return value
+
+
+def _preparation(draft: dict[str, Any]) -> dict[str, Any] | None:
+    """Собственные измеренные ресурсы подготовки входа из состояния черновика."""
+    state = draft.get("ui_state")
+    value = state.get("preparation") if isinstance(state, dict) else None
+    return value if isinstance(value, dict) else None
+
+
+def _preparation_resources(preparation: dict[str, Any] | None) -> dict[str, Any]:
+    """Заморозить отчёты операций подготовки вместе со сводом в ресурсах задания."""
+    if not preparation:
+        return {}
+    reports = [operation["resources"] for operation in preparation.get("operations", [])
+               if isinstance(operation, dict) and isinstance(operation.get("resources"), dict)]
+    values = preparation.get("resources")
+    result = dict(values) if isinstance(values, dict) else {}
+    result["phase_reports"] = reports
+    return result
+
+
+def _preparation_seconds(preparation: dict[str, Any] | None) -> float | None:
+    """Известная кумулятивная длительность подготовки входа или null."""
+    value = preparation.get("wall_seconds") if isinstance(preparation, dict) else None
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+        return None
+    return float(value)
+
+
+def _measurement(value: Any) -> float | int | None:
+    """Конечное неотрицательное измерение или None, без подмены нулём."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+        return None
     return value
 
 
@@ -580,9 +614,15 @@ class Store:
             self._check_quota(owner_id, now_utc)
             now = _utc(now_utc)
             info = draft["snapshot"].get("version_info", {})
+            # Собственная подготовка входа замораживается вместе с принятым снимком.
+            preparation = _preparation(draft)
+            metrics = {"preparation": preparation} if preparation is not None else {}
+            seconds = _preparation_seconds(preparation)
+            if seconds is not None:
+                metrics["preparation_seconds"] = seconds
             self.db.execute(
-                "INSERT INTO jobs(id,owner_id,initial_accepted_at,accepted_at,force_new,status,source_message_id,source_chat_id,source_message_ids,settings,snapshot,models,input_signature,engine_version,engine_commit) VALUES (?,?,?,?,?,'queued',?,?,?,?,?,?,?,?,?)",
-                (draft_id, owner_id, now, now, int(force_new), draft["source_message_id"], draft["source_chat_id"], _json(draft["source_message_ids"]), _json(draft["settings"]), _json(draft["snapshot"]), _json(draft["snapshot"].get("models", {})), draft["input_signature"], info.get("version"), info.get("commit")),
+                "INSERT INTO jobs(id,owner_id,initial_accepted_at,accepted_at,force_new,status,source_message_id,source_chat_id,source_message_ids,settings,snapshot,models,input_signature,engine_version,engine_commit,metrics,resources) VALUES (?,?,?,?,?,'queued',?,?,?,?,?,?,?,?,?,?,?)",
+                (draft_id, owner_id, now, now, int(force_new), draft["source_message_id"], draft["source_chat_id"], _json(draft["source_message_ids"]), _json(draft["settings"]), _json(draft["snapshot"]), _json(draft["snapshot"].get("models", {})), draft["input_signature"], info.get("version"), info.get("commit"), _json(metrics), _json(_preparation_resources(preparation))),
             )
             self._update("drafts", draft_id, {"status": "submitted", "updated_at": now})
             return self.get_job(draft_id)
@@ -808,6 +848,15 @@ class Store:
                     now = _utc()
                     self._update("drafts", work_uuid, {"status": "closed", "closed_at": now, "updated_at": now})
                 return
+            existing = self._one("SELECT * FROM process_bindings WHERE work_uuid=?", (work_uuid,))
+            if existing is not None:
+                previous = existing["binding"]
+                identity = ("launcher_pid", "launcher_start_time", "phase_id")
+                if (not binding or any(key not in previous or key not in binding for key in identity)
+                        or any(binding.get(key) != value for key, value in previous.items())):
+                    raise StoreError("invalid_binding")
+                self.db.execute("UPDATE process_bindings SET binding=? WHERE work_uuid=?", (_json(binding), work_uuid))
+                return
             draft = self.get_draft(work_uuid)
             job = self.get_job(work_uuid)
             if not draft or not self.authorized(draft["owner_id"]):
@@ -1003,12 +1052,40 @@ class Store:
         result["reused_deliveries"] = self.db.execute("SELECT COUNT(*) FROM deliveries WHERE reused=1" + (" AND owner_id=?" if owner_id is not None else ""), (owner_id,) if owner_id is not None else ()).fetchone()[0]
         if owner_id is not None:
             result["quota"] = self.quota(owner_id, utc_now(), actor_id=actor_id)
-        for key in ("cpu_user_seconds", "cpu_system_seconds", "busy_gpu_seconds"):
-            known = [job["resources"][key] for job in jobs if job["resources"].get(key) is not None]
-            result[key] = {"known_total": sum(known) if known else None, "unknown_jobs": len(jobs) - len(known)}
-        for key in ("queue_wait_seconds", "preparation_seconds", "processing_seconds", "render_seconds", "delivery_seconds"):
-            known = [job["metrics"][key] for job in jobs if job["metrics"].get(key) is not None]
-            result[key] = {"known_total": sum(known) if known else None, "unknown_jobs": len(jobs) - len(known)}
+        # Длительности и ресурсы охватывают задания и собственные черновики подготовки.
+        # Черновик учитывается отдельно, пока его вход не вошёл в ресурсы задания.
+        works = [{"metrics": job["metrics"], "resources": job["resources"]} for job in jobs]
+        accounted = {job["id"] for job in jobs}
+        for draft in self._many("SELECT * FROM drafts" + (" WHERE owner_id=?" if owner_id is not None else ""), (owner_id,) if owner_id is not None else ()):
+            preparation = _preparation(draft)
+            if preparation is None or draft["id"] in accounted:
+                continue
+            seconds = _preparation_seconds(preparation)
+            works.append({"metrics": {} if seconds is None else {"preparation_seconds": seconds},
+                          "resources": _preparation_resources(preparation)})
+        for key, field, reduce in (
+            ("cpu_user_seconds", "known_total", sum),
+            ("cpu_system_seconds", "known_total", sum),
+            ("busy_gpu_seconds", "known_total", sum),
+            ("ru_maxrss_kib", "known_peak", max),
+            ("host_rss_peak_kib", "known_peak", max),
+            ("vram_peak_bytes", "known_peak", max),
+        ):
+            known = [work["resources"][key] for work in works if _measurement(work["resources"].get(key)) is not None]
+            unknown = sum(
+                _measurement(work["resources"].get(key)) is None
+                or any(not isinstance(report, dict) or _measurement(report.get(key)) is None
+                       for report in (work["resources"].get("phase_reports") or ()))
+                for work in works
+            )
+            result[key] = {field: reduce(known) if known else None, "unknown_works": unknown}
+        for key in ("queue_wait_seconds", "preparation_seconds", "processing_seconds", "render_seconds"):
+            durations = works if key == "preparation_seconds" else jobs
+            known = [work["metrics"][key] for work in durations if _measurement(work["metrics"].get(key)) is not None]
+            result[key] = {"known_total": sum(known) if known else None, "unknown_works": len(durations) - len(known)}
+        deliveries = self._many("SELECT metrics FROM deliveries" + (" WHERE owner_id=?" if owner_id is not None else ""), (owner_id,) if owner_id is not None else ())
+        known_delivery = [delivery["metrics"]["delivery_seconds"] for delivery in deliveries if delivery["metrics"].get("delivery_seconds") is not None]
+        result["delivery_seconds"] = {"known_total": sum(known_delivery) if known_delivery else None, "unknown_deliveries": len(deliveries) - len(known_delivery)}
         for key in ("prompt_tokens", "completion_tokens", "cache_hit", "cache_miss", "reasoning_tokens"):
             known = []
             for call in calls:

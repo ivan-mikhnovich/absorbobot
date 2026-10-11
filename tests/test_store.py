@@ -61,6 +61,27 @@ def complete(store, job, at=NOW):
     return store.update_job(job["id"], status="completed", completed_at=at)
 
 
+def with_preparation(store, draft, wall=2.0, cpu=1.5, system=0.25):
+    """Записать собственные измерения подготовки входа в состояние черновика."""
+    state = dict(draft["ui_state"])
+    state["preparation"] = {
+        "schema_version": 1, "wall_seconds": wall, "updated_at": NOW.isoformat(),
+        "operations": [{
+            "operation": "copy", "status": "complete", "reason": None,
+            "started_at": NOW.isoformat(), "ended_at": NOW.isoformat(), "wall_seconds": wall,
+            "resources": {"schema_version": 1, "phase_id": "input_copy", "exit_code": None,
+                          "cpu_user_seconds": cpu, "cpu_system_seconds": system,
+                          "ru_maxrss_kib": None, "completeness": "partial",
+                          "reason": "thread_rss_unavailable"}}],
+        "resources": {"schema_version": 1, "phases": 1, "cpu_user_seconds": cpu,
+                      "cpu_system_seconds": system, "ru_maxrss_kib": None,
+                      "host_rss_peak_kib": None, "busy_gpu_seconds": None, "vram_peak_bytes": None,
+                      "completeness": "partial", "unknown_phases": 1,
+                      "incomplete_phase_ids": ["input_copy"]},
+    }
+    return store.update_draft(draft["owner_id"], draft["id"], ui_state=state)
+
+
 def error_code(code):
     return pytest.raises(StoreError, match=f"^{code}$")
 
@@ -715,7 +736,7 @@ def test_immutable_tariffs_attempt_ingest_decimal_costs_and_user_stats_redaction
     assert admin["api_attempts"] == 2
     assert admin["estimated_api_cost"] == {"known_totals": {"USD": "0.000012"}, "incomplete_calls": 1}
     assert admin["completion_tokens"] == {"known_total": 3, "unknown_calls": 1}
-    assert admin["cpu_user_seconds"] == {"known_total": None, "unknown_jobs": 1}
+    assert admin["cpu_user_seconds"] == {"known_total": None, "unknown_works": 1}
     user = store.stats(ALICE)
     assert "estimated_api_cost" not in user
     assert not any(word in str(user).lower() for word in ("usd", "tariff", "price", "cost", "amount"))
@@ -754,6 +775,45 @@ def test_reuse_does_not_transfer_original_api_or_resources_to_recipient(store):
     assert store.stats(BOB)["cpu_user_seconds"]["known_total"] == 8.5
     store.purge(ADMIN, source["id"])
     assert store.stats(BOB, include_cost=True, actor_id=ADMIN)["estimated_api_cost"]["known_totals"] == {"USD": "1.2"}
+
+
+def test_enqueue_freezes_own_preparation_into_job_metrics_and_resources(store):
+    draft = with_preparation(store, ready(store))
+    job = store.enqueue(ALICE, draft["id"], NOW, force_new=True)
+    # Собственная подготовка входа заморожена вместе со снимком, а не пересчитана.
+    assert job["metrics"]["preparation_seconds"] == 2.0
+    assert job["metrics"]["preparation"]["wall_seconds"] == 2.0
+    assert job["resources"]["cpu_user_seconds"] == 1.5
+    assert job["resources"]["cpu_system_seconds"] == 0.25
+    assert job["resources"]["phase_reports"] == [
+        job["metrics"]["preparation"]["operations"][0]["resources"]]
+
+
+def test_preparation_is_counted_once_whether_in_job_or_standalone_draft(store):
+    draft = with_preparation(store, ready(store))
+    store.enqueue(ALICE, draft["id"], NOW, force_new=True)
+    stats = store.stats(ALICE)
+    assert stats["jobs"] == 1
+    assert stats["cpu_user_seconds"]["known_total"] == 1.5
+    assert stats["cpu_system_seconds"]["known_total"] == 0.25
+    assert stats["preparation_seconds"]["known_total"] == 2.0
+    assert stats["cpu_user_seconds"]["unknown_works"] == 0
+
+
+def test_free_reuse_with_full_quota_keeps_only_recipient_preparation(store):
+    source_draft = with_preparation(store, ready(store, BOB), wall=9.0, cpu=8.5, system=2.0)
+    source = complete(store, store.enqueue(BOB, source_draft["id"], NOW, force_new=False))
+    for index in range(10):
+        enqueue(store, at=NOW + timedelta(seconds=index + 1), signature=str(index))
+    recipient = with_preparation(store, ready(store, signature="same"), wall=2.0, cpu=1.5, system=0.25)
+    store.reuse_draft(ALICE, recipient["id"], source["id"], NOW)
+    stats = store.stats(ALICE, include_cost=True, actor_id=ADMIN)
+    assert stats["jobs"] == 10 and stats["api_attempts"] == 0
+    # Получатель бесплатного повторного использования платит только за свою подготовку.
+    assert stats["estimated_api_cost"]["known_totals"] == {}
+    assert stats["cpu_user_seconds"]["known_total"] == 1.5
+    assert stats["preparation_seconds"]["known_total"] == 2.0
+    assert store.stats(BOB, include_cost=True, actor_id=ADMIN)["cpu_user_seconds"]["known_total"] == 8.5
 
 
 def test_simultaneous_workers_claim_one_execution_even_before_process_binding(store, settings):
@@ -807,7 +867,7 @@ def test_owned_lookup_missing_is_none_and_unknown_usage_is_not_zero(store):
     stats = store.stats(ALICE)
     assert stats["prompt_tokens"] == {"known_total": None, "unknown_calls": 1}
     assert stats["cache_hit"] == {"known_total": None, "unknown_calls": 1}
-    assert stats["busy_gpu_seconds"] == {"known_total": None, "unknown_jobs": 1}
+    assert stats["busy_gpu_seconds"] == {"known_total": None, "unknown_works": 1}
 
 
 def test_admin_retains_banned_user_history_and_quota(store):
@@ -834,3 +894,50 @@ def test_only_admin_can_obtain_money_or_global_statistics(store):
         store.stats()
     assert "estimated_api_cost" not in store.stats(ALICE)
     assert store.stats(include_cost=True, actor_id=ADMIN)["jobs"] == 1
+
+
+def test_binding_enrichment_retains_identity_even_after_ban(store):
+    job = enqueue(store)
+    store.claim_next(NOW)
+    binding = {"launcher_pid": 12000, "launcher_start_time": 17.5, "phase_id": "probe"}
+    store.bind_process(job["id"], binding)
+    store.ban_user(ADMIN, ALICE, NOW)
+    enriched = {**binding, "namespace_pid": 12001, "namespace_start_time": 17.6, "pgid": 12001}
+    store.bind_process(job["id"], enriched)
+    assert store.process_bindings()[0]["binding"] == enriched
+    assert store.claim_next(NOW) is None
+    for field, changed in (("launcher_pid", 13000), ("launcher_start_time", 19),
+                           ("phase_id", "different"), ("pgid", 1)):
+        with error_code("invalid_binding"):
+            store.bind_process(job["id"], {**enriched, field: changed})
+    with error_code("invalid_binding"):
+        store.bind_process(job["id"], binding)
+    store.bind_process(job["id"], None)
+    assert not store.process_bindings()
+
+
+def test_memory_statistics_take_peak_and_keep_partially_unknown_work_visible(store):
+    first = complete(store, enqueue(store, signature="first"))
+    store.update_job(first["id"], resources={
+        "cpu_user_seconds": 3, "ru_maxrss_kib": 4, "vram_peak_bytes": 10,
+        "phase_reports": [{"cpu_user_seconds": 3, "ru_maxrss_kib": 4, "vram_peak_bytes": 10},
+                          {"cpu_user_seconds": None, "ru_maxrss_kib": None, "vram_peak_bytes": None}]})
+    second = complete(store, enqueue(store, at=NOW + timedelta(seconds=1), signature="second"))
+    store.update_job(second["id"], resources={
+        "cpu_user_seconds": 5, "ru_maxrss_kib": 6, "vram_peak_bytes": 20,
+        "phase_reports": [{"cpu_user_seconds": 5, "ru_maxrss_kib": 6, "vram_peak_bytes": 20}]})
+    foreign = complete(store, enqueue(store, BOB, NOW + timedelta(seconds=2), signature="foreign"))
+    store.update_job(foreign["id"], resources={"ru_maxrss_kib": 99, "vram_peak_bytes": 99})
+    stats = store.stats(ALICE)
+    assert stats["cpu_user_seconds"] == {"known_total": 8, "unknown_works": 1}
+    assert stats["ru_maxrss_kib"] == {"known_peak": 6, "unknown_works": 1}
+    assert stats["vram_peak_bytes"] == {"known_peak": 20, "unknown_works": 1}
+    assert store.stats(actor_id=ADMIN)["ru_maxrss_kib"]["known_peak"] == 99
+
+
+def test_preparation_only_draft_does_not_become_unknown_processing_work(store):
+    with_preparation(store, ready(store))
+    stats = store.stats(ALICE)
+    assert stats["preparation_seconds"]["known_total"] == 2
+    assert stats["processing_seconds"] == {"known_total": None, "unknown_works": 0}
+    assert stats["render_seconds"] == {"known_total": None, "unknown_works": 0}

@@ -11,6 +11,7 @@ from pathlib import PurePath
 
 from .i18n import tr
 from .store import StoreError, QuotaError
+from .workers.youtube import YouTubeError, normalize_youtube_url
 
 
 COMMANDS = ('start', 'new', 'jobs', 'settings', 'language', 'help', 'cancel', 'stats', 'version')
@@ -191,8 +192,11 @@ class Dialog:
         if draft['status'] == 'preparing' or draft['close_requested']:
             self._send(owner, tr(self._language(owner), 'dialog.preparing'))
             return
-        if message.get('text') and (not message['text'].startswith('https://') or any(c.isspace() for c in message['text'])):
-            raise StoreError('unsupported_input')
+        if message.get('text'):
+            try:
+                normalize_youtube_url(message['text'])
+            except YouTubeError:
+                raise StoreError('unsupported_input') from None
         state = dict(draft['ui_state'])
         source = self._source(message)
         pending = state.get('pending_import_ids', [])
@@ -343,9 +347,10 @@ class Dialog:
         lines = [tr(lang, 'dialog.stats', jobs=stats['jobs'], attempts=stats['api_attempts'], deliveries=stats['deliveries'], reuse=stats['reused_deliveries'], remaining=stats['quota']['remaining'] if stats['quota']['remaining'] is not None else tr(lang, 'dialog.unlimited'))]
         for status, count in stats['statuses'].items():
             lines.append(f'{tr(lang, "status." + status)}: {count}')
-        for key in ('cpu_user_seconds', 'cpu_system_seconds', 'busy_gpu_seconds', 'queue_wait_seconds', 'preparation_seconds', 'processing_seconds', 'render_seconds', 'delivery_seconds', 'prompt_tokens', 'completion_tokens', 'cache_hit', 'cache_miss', 'reasoning_tokens'):
+        for key in ('cpu_user_seconds', 'cpu_system_seconds', 'busy_gpu_seconds', 'ru_maxrss_kib', 'host_rss_peak_kib', 'vram_peak_bytes', 'queue_wait_seconds', 'preparation_seconds', 'processing_seconds', 'render_seconds', 'delivery_seconds', 'prompt_tokens', 'completion_tokens', 'cache_hit', 'cache_miss', 'reasoning_tokens'):
             metric = stats[key]
-            lines.append(tr(lang, 'dialog.metric', name=tr(lang, 'metric.' + key), total=metric['known_total'] if metric['known_total'] is not None else tr(lang, 'unknown'), unknown=metric.get('unknown_jobs', metric.get('unknown_calls'))))
+            value = metric.get('known_total', metric.get('known_peak'))
+            lines.append(tr(lang, 'dialog.metric', name=tr(lang, 'metric.' + key), total=value if value is not None else tr(lang, 'unknown'), unknown=metric.get('unknown_works', metric.get('unknown_calls', metric.get('unknown_deliveries', 0)))))
         self._send(owner, '\n'.join(lines))
 
     def _cancel_prompt(self, owner):
