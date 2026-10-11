@@ -1,0 +1,66 @@
+{
+  "schema_version": 1,
+  "dated": "2026-10-10",
+  "currency": "USD",
+  "unit": "per_million_tokens",
+  "source": "https://api-docs.deepseek.com/quick_start/pricing/",
+  "readings": [
+    {
+      "url": "https://api-docs.deepseek.com/quick_start/pricing/",
+      "retrieved_utc": "2026-10-10T23:13:50Z",
+      "note": "Peak hourly rates; off-peak is half; cache hit/miss partition of prompt tokens."
+    },
+    {
+      "url": "https://api-docs.deepseek.com/quick_start/pricing/",
+      "retrieved_utc": "2026-10-11T01:29:34Z",
+      "note": "Release recheck: rates and peak schedule unchanged; legacy Flash names served by DeepSeek-V4.1-Flash."
+    },
+    {
+      "url": "https://www.gov.cn/yaowen/liebiao/202511/content_7047099.htm",
+      "retrieved_utc": "2026-10-10T23:13:50Z",
+      "note": "2026 mainland China public holidays in Asia/Shanghai dates."
+    }
+  ],
+  "off_peak_factor": "0.5",
+  "peak_windows_utc": [
+    {"start": "01:00", "end": "04:00"},
+    {"start": "06:00", "end": "10:00"}
+  ],
+  "peak_weekdays": ["Mon", "Tue", "Wed", "Thu", "Fri"],
+  "providers": {
+    "deepseek": {
+      "host": "api.deepseek.com",
+      "names": ["deepseek"]
+    }
+  },
+  "calendar": {
+    "timezone": "Asia/Shanghai",
+    "holidays": {
+      "2026": [
+        "2026-01-01", "2026-01-02", "2026-01-03",
+        "2026-02-15", "2026-02-16", "2026-02-17", "2026-02-18", "2026-02-19",
+        "2026-02-20", "2026-02-21", "2026-02-22", "2026-02-23",
+        "2026-04-04", "2026-04-05", "2026-04-06",
+        "2026-05-01", "2026-05-02", "2026-05-03", "2026-05-04", "2026-05-05",
+        "2026-06-19", "2026-06-20", "2026-06-21",
+        "2026-09-25", "2026-09-26", "2026-09-27",
+        "2026-10-01", "2026-10-02", "2026-10-03", "2026-10-04", "2026-10-05",
+        "2026-10-06", "2026-10-07"
+      ]
+    }
+  },
+  "tiers": {
+    "flash": {
+      "peak": {"cache_hit": "0.006", "cache_miss": "0.30", "output": "1.20"}
+    },
+    "pro": {
+      "peak": {"cache_hit": "0.044", "cache_miss": "1.32", "output": "3.96"}
+    }
+  },
+  "models": {
+    "deepseek-flash": "flash",
+    "deepseek-v4-flash": "flash",
+    "deepseek-v4-flash-vision-exp": "flash",
+    "deepseek-v4-pro": "pro"
+  }
+}
