@@ -1029,7 +1029,19 @@ class Store:
     def chat_tail(self, chat_id: int) -> int:
         """Наибольший известный id сообщения чата: и своего, и присланного владельцем."""
         row = self._one("SELECT last_message_id FROM chat_tails WHERE chat_id=?", (chat_id,))
-        return int(row["last_message_id"]) if row is not None else 0
+        if row is not None:
+            return int(row["last_message_id"])
+        # До первой записи конец чата восстанавливается по уже отправленному.
+        history = self._one(
+            "SELECT MAX(CAST(json_extract(result,'$.message_id') AS INTEGER)) AS tail FROM outbox "
+            "WHERE kind='telegram' AND status='sent' AND json_extract(result,'$.message_id') IS NOT NULL "
+            "AND json_extract(payload,'$.kwargs.chat_id')=?",
+            (chat_id,),
+        )
+        tail = int(history["tail"]) if history is not None and history["tail"] is not None else 0
+        if tail > 0:
+            self.record_chat_tail(chat_id, tail)
+        return tail
 
     def process_update(self, update_id: int, mutator: Callable[[], Any]) -> bool:
         with self.transaction():
@@ -1062,6 +1074,11 @@ class Store:
             raise StoreError("invalid_error_code")
         with self.transaction():
             self.db.execute("UPDATE outbox SET available_at=?,error_code=?,attempts=attempts+1 WHERE id=? AND status='pending'", (_utc(available_at), error_code, id))
+
+    def update_outbox_payload(self, id: int, payload: dict) -> None:
+        """Переписать ещё не отправленное действие: продюсер и доставщик дописывают его сами."""
+        with self.transaction():
+            self.db.execute("UPDATE outbox SET payload=? WHERE id=? AND status='pending'", (_json(payload), id))
 
     def progress_actions(self, work_uuid: str) -> list[dict]:
         """Действия прогресса одного задания в порядке постановки."""

@@ -427,6 +427,21 @@ def test_progress_resends_when_it_is_no_longer_last(tmp_path, clock):
                  if row["payload"].get("method") == "delete_message"]
         assert [row["payload"]["kwargs"]["message_id"] for row in drops] == [stale]
         assert outbox_result(store, edit)["progress"] is True
+        # Отставшая строка стала отправкой: её сообщение снова известно состоянию.
+        assert json.loads(outbox_row(store, edit)["payload"])["method"] == "send_rich_message"
+        assert store.progress_message_id(job["id"]) == outbox_result(store, edit)["message_id"]
+        assert store.progress_message_id(job["id"]) != stale
+
+
+def test_chat_tail_falls_back_to_sent_history(tmp_path, clock):
+    """Конец чата восстанавливается по отправленному, пока таблица ещё пуста."""
+    settings = make_settings(tmp_path)
+    with Store(settings) as store:
+        store.allow_user(1, 2)
+        sent = store.add_outbox("telegram", {"owner_id": 2, "method": "send_message",
+                                             "kwargs": {"chat_id": 2, "text": "старое сообщение"}})
+        store.outbox_sent(sent, {"message_id": 777})
+        assert store.chat_tail(2) == 777
 
 
 def test_missing_progress_message_is_sent_again(tmp_path, clock):

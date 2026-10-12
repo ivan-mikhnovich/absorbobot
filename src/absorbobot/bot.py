@@ -180,6 +180,9 @@ class TelegramOutbox:
                                           (_utc(deadline), item_id))
                 return
         method, kwargs, fallback = self._progress_target(owner, payload, message_id, work["source_message_id"])
+        if payload.get("method") != method:
+            # Отправка вместо правки: строка обязана помнить свой вид, иначе её сообщение потеряется.
+            self.store.update_outbox_payload(item_id, {**payload, "method": method})
         outcome = await self._dispatch(item, method, kwargs, extra={"progress": True},
                                        on_bad_request="fail", payload=payload, fallback=fallback)
         if outcome == "rejected" and method == "edit_message_text":
