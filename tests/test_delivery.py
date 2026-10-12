@@ -3,8 +3,9 @@ from datetime import datetime, timezone
 
 import pytest
 
+import absorbobot.delivery as delivery_module
 from absorbobot.config import Settings
-from absorbobot.delivery import Delivery, package_result
+from absorbobot.delivery import Delivery, FORMATS, package_result
 from absorbobot.store import Store, StoreError
 
 
@@ -83,10 +84,12 @@ def plan(store, job, request=50):
     return delivery, payload, files, delivery.enqueue(payload, request, files)
 
 
-def test_completed_processing_survives_partial_delivery_and_restart(store):
+def test_completed_processing_survives_partial_delivery_and_restart(store, monkeypatch):
+    monkeypatch.setattr(delivery_module, "ALBUM_LIMIT", 2)
     job = completed(store)
     delivery, payload, files, record = plan(store, job)
     actions = store.pending_outbox(100)
+    assert len(actions) == 2
     store.outbox_sent(actions[0]["id"], {"message_id": 11})
     delivery.reconcile()
     assert store.deliveries(2)[0]["status"] == "pending"
@@ -175,3 +178,32 @@ def test_reuse_delivery_carries_recipient_preparation_not_source_work(store):
     assert "processing_seconds" not in metrics and "cpu_user_seconds" not in metrics
     assert store.stats(2)["cpu_user_seconds"]["known_total"] == 0.5
     assert store.stats(3)["cpu_user_seconds"]["known_total"] == 8.5
+
+
+def test_album_chunks_avoid_a_singleton_tail():
+    assert [len(chunk) for chunk in delivery_module.album_chunks(list(range(11)))] == [9, 2]
+    assert [len(chunk) for chunk in delivery_module.album_chunks(list(range(20)))] == [10, 10]
+    assert [len(chunk) for chunk in delivery_module.album_chunks(list(range(4)))] == [4]
+
+
+def test_delivery_attaches_every_format_to_one_album(store):
+    job = completed(store)
+    delivery, payload, files, record = plan(store, job)
+    actions = store.pending_outbox(100)
+    assert len(actions) == 1
+    data = actions[0]["payload"]
+    assert data["method"] == "send_media_group"
+    assert [attachment["filename"] for attachment in data["files"]] == list(FORMATS)
+    assert data["documents"] == len(FORMATS)
+    assert data["caption"].startswith("Lecture notes")
+    assert record["documents"] == len(FORMATS)
+
+
+def test_delivery_splits_many_attachments_into_several_albums(store, monkeypatch):
+    monkeypatch.setattr(delivery_module, "ALBUM_LIMIT", 3)
+    job = completed(store)
+    delivery, payload, files, record = plan(store, job)
+    actions = store.pending_outbox(100)
+    assert [action["payload"]["documents"] for action in actions] == [2, 2]
+    assert [action["payload"]["method"] for action in actions] == \
+        ["send_media_group", "send_media_group"]

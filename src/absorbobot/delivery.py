@@ -18,6 +18,21 @@ from absorbobot.store import Store, StoreError, utc_now
 
 FORMATS = ("notes.md", "notes.html", "notes.pdf", "notes.zip")
 CHUNK = 1024 * 1024
+ALBUM_LIMIT = 10
+
+
+def album_chunks(files: list[dict], limit: int = ALBUM_LIMIT) -> list[list[dict]]:
+    """Разбить вложения на альбомы: не больше лимита и без одинокого хвоста."""
+    if limit < 2:
+        raise ValueError("album limit must be at least two.")
+    chunks, start = [], 0
+    while start < len(files):
+        size = min(limit, len(files) - start)
+        if len(files) - start - size == 1:
+            size -= 1
+        chunks.append(files[start:start + size])
+        start += size
+    return chunks
 
 
 def contained_file(root: Path, relative: str) -> Path:
@@ -114,7 +129,7 @@ def split_file(path: Path, destination: Path, part_bytes: int) -> tuple[list[Pat
 
 
 class Delivery:
-    """Сохранить независимые отправки каждого файла и части, не запускать ядро."""
+    """Сохранить независимые отправки альбомов выдачи, не запускать ядро."""
 
     def __init__(self, settings, store: Store):
         self.settings, self.store = settings, store
@@ -218,13 +233,14 @@ class Delivery:
             caption = tr(language, "delivery.caption", id=work_title(self.store, draft or source, viewer=owner),
                          version=source["engine_version"], commit=source["engine_commit"])
             reply = draft["source_message_id"] if draft else None
-            for index, file in enumerate(files):
-                kwargs = {"chat_id": owner, "caption": caption}
+            for index, chunk in enumerate(album_chunks(files, ALBUM_LIMIT)):
+                kwargs = {"chat_id": owner}
                 if reply is not None:
                     kwargs["reply_parameters"] = {"message_id": reply, "allow_sending_without_reply": True}
                 self.store.add_outbox("telegram", {
-                    "owner_id": owner, "method": "send_document", "kwargs": kwargs,
-                    "work_uuid": source_id, "delivery_id": delivery["id"], **file,
+                    "owner_id": owner, "method": "send_media_group", "kwargs": kwargs,
+                    "work_uuid": source_id, "delivery_id": delivery["id"],
+                    "caption": caption, "files": chunk, "documents": len(chunk),
                 }, dedupe_key=f"delivery:{delivery['id']}:{index}")
             metrics = self._metrics(delivery)
             metrics.update({"request_outbox_id": request_id,

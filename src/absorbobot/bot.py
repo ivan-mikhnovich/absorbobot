@@ -16,7 +16,7 @@ from aiogram.exceptions import (
     TelegramBadRequest, TelegramForbiddenError, TelegramNetworkError,
     TelegramRetryAfter, TelegramServerError,
 )
-from aiogram.types import BotCommand, FSInputFile, Update
+from aiogram.types import BotCommand, FSInputFile, InputMediaDocument, Update
 
 from absorbobot.admin import Admin
 from absorbobot.config import Settings, probe_core
@@ -62,7 +62,7 @@ class UpdateRouter:
 class TelegramOutbox:
     """Отправить сохранённые действия без повторения оплаченной обработки."""
 
-    METHODS = frozenset({"send_message", "send_photo", "send_document",
+    METHODS = frozenset({"send_message", "send_photo", "send_document", "send_media_group",
                          "edit_message_text", "answer_callback_query"})
     PROGRESS_INTERVAL = timedelta(seconds=5)
 
@@ -196,6 +196,26 @@ class TelegramOutbox:
                 self.store.outbox_sent(item["id"], {"skipped": "artifact_missing"})
                 return
             kwargs["document"] = FSInputFile(path, filename=payload.get("filename", path.name))
+        if method == "send_media_group":
+            # Один альбом — одно сообщение; подпись Telegram показывает только у первого вложения.
+            source = self.store.get_job(payload["work_uuid"])
+            if (not source or source["status"] != "completed" or source["files_deleted"]
+                    or not self.store.authorized(source["owner_id"])):
+                self.store.outbox_sent(item["id"], {"skipped": "source_unavailable"})
+                return
+            base = (self.store.settings.storage_dir / "jobs").resolve()
+            root = base / source["id"]
+            media = []
+            for position, file in enumerate(payload["files"]):
+                path = (root / file["file"]).resolve()
+                if (root.is_symlink() or not root.resolve().is_relative_to(base)
+                        or not path.is_relative_to(root) or not path.is_file()):
+                    self.store.outbox_sent(item["id"], {"skipped": "artifact_missing"})
+                    return
+                media.append(InputMediaDocument(
+                    media=FSInputFile(path, filename=file.get("filename", path.name)),
+                    caption=payload.get("caption") if position == 0 else None))
+            kwargs["media"] = media
         await self._dispatch(item, method, kwargs)
 
     async def _dispatch(self, item: dict, method: str, kwargs: dict, *, extra: dict | None = None) -> None:
@@ -213,7 +233,11 @@ class TelegramOutbox:
             else:
                 self.store.outbox_retry(item["id"], utc_now() + timedelta(seconds=300), type(exc).__name__)
         else:
-            result = {"message_id": response.message_id} if hasattr(response, "message_id") else {"ok": bool(response)}
+            # Альбом отвечает списком сообщений: сохранить идентификатор первого.
+            identifier = response.message_id if hasattr(response, "message_id") else None
+            if identifier is None and isinstance(response, list) and response:
+                identifier = getattr(response[0], "message_id", None)
+            result = {"message_id": identifier} if identifier is not None else {"ok": bool(response)}
             if extra:
                 result.update(extra)
             self.store.outbox_sent(item["id"], result)

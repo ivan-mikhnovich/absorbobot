@@ -12,6 +12,7 @@ import absorbobot.store as store_module
 from absorbobot.admin import Admin
 from absorbobot.bot import TelegramOutbox, UpdateRouter
 from absorbobot.config import Settings
+from absorbobot.delivery import Delivery, package_result
 from absorbobot.engine import Engine
 from absorbobot.i18n import tr
 from absorbobot.dialog import Dialog
@@ -154,6 +155,15 @@ class FakeBot:
 
     async def edit_message_text(self, **kwargs):
         return self._record("edit_message_text", kwargs)
+
+    async def send_media_group(self, **kwargs):
+        if self.fail is not None:
+            failure, self.fail = self.fail, None
+            raise failure
+        self.calls.append(("send_media_group", kwargs))
+        self.next_message_id += 1
+        return [SimpleNamespace(message_id=self.next_message_id + index)
+                for index in range(len(kwargs["media"]))]
 
     def _record(self, method, kwargs):
         if self.fail is not None:
@@ -377,5 +387,42 @@ def test_non_progress_notices_are_neither_gated_nor_coalesced(tmp_path, clock):
         for item_id in notices:
             result = outbox_result(store, item_id)
             assert result.get("message_id") and "progress" not in result
+
+
+def completed_job(store, owner=2):
+    """Завершённое задание с четырьмя форматами результата для выдачи."""
+    job = make_job(store, owner)
+    tree = store.settings.storage_dir / "jobs" / job["id"]
+    store.claim_next(NOW)
+    store.update_job(job["id"], status="running")
+    output = tree / "output"
+    (output / ".absorbent").mkdir(parents=True)
+    for name in ("notes.md", "notes.html", "notes.pdf"):
+        (output / name).write_bytes(b"lecture notes")
+    (output / ".absorbent" / "transcript.json").write_text("[]")
+    package_result(tree)
+    return store.update_job(job["id"], status="completed")
+
+
+def test_delivery_sends_one_album_with_caption_on_the_first_document(tmp_path, clock):
+    settings = make_settings(tmp_path)
+    with Store(settings) as store:
+        store.allow_user(1, 2)
+        job = completed_job(store)
+        delivery = Delivery(store.settings, store)
+        payload = {"owner_id": 2, "source_job_id": job["id"], "work_uuid": job["id"]}
+        files = asyncio.run(delivery.prepare_files(payload))
+        delivery.enqueue(payload, 70, files)
+        items = [row for row in store.pending_outbox(100) if row["kind"] == "telegram"]
+        assert len(items) == 1
+        bot = FakeBot()
+        dispatch(store, TelegramOutbox(bot, store), items[0]["id"])
+        method, kwargs = bot.calls[-1]
+        assert method == "send_media_group"
+        assert [media.media.filename for media in kwargs["media"]] == \
+            ["notes.md", "notes.html", "notes.pdf", "notes.zip"]
+        assert kwargs["media"][0].caption.startswith("Lecture notes")
+        assert all(media.caption is None for media in kwargs["media"][1:])
+        assert outbox_result(store, items[0]["id"])["message_id"] == 1001
 
 

@@ -216,12 +216,17 @@ class Engine:
             if not work or work["owner_id"] != row["owner_id"]:
                 continue
             actions = self.store.db.execute(
-                "SELECT status,result FROM outbox WHERE dedupe_key LIKE ?", (f"delivery:{row['id']}:%",)
+                "SELECT status,result,payload FROM outbox WHERE dedupe_key LIKE ?", (f"delivery:{row['id']}:%",)
             ).fetchall()
-            completed = sum(action["status"] == "sent" and not json.loads(action["result"] or "{}").get("skipped") for action in actions)
+            completed = total = 0
+            for action in actions:
+                count = json.loads(action["payload"]).get("documents", 1)
+                total += count
+                if action["status"] == "sent" and not json.loads(action["result"] or "{}").get("skipped"):
+                    completed += count
             final = row["status"] == "sent"
             self._progress_action(work, "status.delivered" if final else "stage.delivery",
-                                  detail={"completed": completed, "total": len(actions), "unit": "items"}, final=final)
+                                  detail={"completed": completed, "total": total, "unit": "items"}, final=final)
             if final:
                 metrics["feedback_completed"] = True
                 self.store.db.execute("UPDATE deliveries SET metrics=? WHERE id=?", (json.dumps(metrics), row["id"]))
