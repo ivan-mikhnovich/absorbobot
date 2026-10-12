@@ -91,6 +91,42 @@ def test_authorized_foreign_callback_is_acknowledged_without_consuming_token(run
     assert len(store.pending_outbox()) == 1
 
 
+def test_menu_callback_with_link_preview_creates_a_draft(runtime):
+    store, router = runtime
+    router.handle(update(1, 1))
+    menu = next(row["payload"]["kwargs"] for row in store.pending_outbox()
+                if row["payload"]["method"] == "send_message")
+    token = next(button["callback_data"] for row in menu["reply_markup"]["inline_keyboard"]
+                 for button in row if button["text"] == tr("ru", "button.new"))
+    raw = update(2, 1, callback=token).model_dump(mode="json", by_alias=True, exclude_none=True)
+    message = raw["callback_query"]["message"]
+    message.update(text=menu["text"], reply_markup=menu["reply_markup"],
+                   link_preview_options={"url": "https://github.com/ivan-mikhnovich/absorbent"})
+    message["from"] = {"id": 8939463977, "is_bot": True, "first_name": "Absorbent"}
+
+    router.handle(Update.model_validate(raw))
+
+    assert store.active_draft(1)["status"] == "collecting"
+    assert store.offset() == 3
+    with pytest.raises(StoreError, match="token_consumed"):
+        store.consume_token(1, token)
+
+
+def test_incoming_file_url_with_link_preview_is_accepted_for_draft(runtime):
+    store, router = runtime
+    router.handle(update(1, 1, text="/new"))
+    url = "https://example.org/lecture.wav"
+    raw = update(2, 1, text=url).model_dump(mode="json", by_alias=True, exclude_none=True)
+    raw["message"]["link_preview_options"] = {"url": url}
+
+    router.handle(Update.model_validate(raw))
+
+    draft = store.active_draft(1)
+    assert draft["source_message_id"] == 2
+    assert draft["ui_state"]["pending_import_ids"] == [2]
+    assert store.offset() == 3
+
+
 def test_domain_failure_rolls_back_offset_user_and_callback_ack(runtime, monkeypatch):
     store, router = runtime
     def fail(message):

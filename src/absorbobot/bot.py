@@ -43,8 +43,9 @@ class UpdateRouter:
                 sender.id, username=sender.username,
                 full_name=sender.full_name, language=language_for(sender.language_code),
             )
+            # Сериализуем только поля Telegram, без служебных Default aiogram.
             if callback:
-                payload = callback.model_dump(mode="json", by_alias=True, exclude_none=True)
+                payload = callback.model_dump(mode="json", by_alias=True, exclude_none=True, exclude_unset=True)
                 self.store.add_outbox("telegram", {
                     "owner_id": sender.id, "method": "answer_callback_query",
                     "kwargs": {"callback_query_id": callback.id},
@@ -52,7 +53,7 @@ class UpdateRouter:
                 if not self.admin.handle_callback(payload):
                     self.dialog.handle_callback(payload)
             else:
-                payload = message.model_dump(mode="json", by_alias=True, exclude_none=True)
+                payload = message.model_dump(mode="json", by_alias=True, exclude_none=True, exclude_unset=True)
                 if not self.admin.handle_message(payload):
                     self.dialog.handle_message(payload)
         return self.store.process_update(update.update_id, mutate)
