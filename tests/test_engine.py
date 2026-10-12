@@ -220,3 +220,33 @@ def test_engine_adds_input_preparation_and_persists_full_phase_reports(state, mo
     # Причина недоступности GPU и наблюдения чужих устройств переживают хранение.
     assert reports[1]['gpu']['reason'] == 'nvml_unavailable'
     assert reports[1]['shared_device_observations'][0]['gpu_utilization'] == 70
+
+
+def test_pending_intake_of_collecting_draft_gets_queued_stage(state):
+    """Ожидающий импорт другой лекции показывает стадию ожидания.
+
+    Ключ подписи этой стадии берётся из каталога: прежде пропущенный
+    `input.queued` ронял службу в цикл перезапусков.
+    """
+    store, engine, _ = state
+    draft = store.create_draft(2, source_message_id=123)
+    store.add_outbox("intake", {"owner_id": 2, "draft_id": draft["id"],
+                                "message": {"message_id": 123, "chat": {"id": 2}}})
+    # Пауза не даёт движку начать импорт: проверяется только сообщение о стадии.
+    store.set_paused(1, True)
+    stop = asyncio.Event()
+
+    async def scenario():
+        task = asyncio.create_task(engine.run(stop))
+        for _ in range(50):
+            await asyncio.sleep(0.05)
+            if any("Waiting for the download to start" in str(row["payload"])
+                   for row in store.pending_outbox(limit=50)):
+                break
+        stop.set()
+        await task
+
+    asyncio.run(scenario())
+    texts = [row["payload"].get("kwargs", {}).get("text", "")
+             for row in store.pending_outbox(limit=50) if row["kind"] == "telegram"]
+    assert any("Waiting for the download to start" in text for text in texts)

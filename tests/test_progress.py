@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 
 import pytest
@@ -66,5 +67,46 @@ def test_discard_removes_only_stage_file(tmp_path):
     assert progress.read_progress(tmp_path, "external", "bytes") is not None
     # Повторная очистка отсутствующего файла не поднимает ошибок.
     progress.discard_progress(tmp_path, "copy")
+
+
+# Стадии, которые движок передаёт в сообщение о прогрессе: подпись стадии
+# берётся из каталога, поэтому пропущенный ключ роняет службу целиком.
+def test_every_progress_stage_has_a_localized_text():
+    from absorbobot.i18n import catalogues
+    from absorbobot.intake import STAGES
+
+    stages = [*(f"input.{stage}" for stage in STAGES),
+              # Приём записи и статусы заданий.
+              "input.queued", "input.ready", "input.failed",
+              "status.queued", "status.delivered", "status.failed", "status.cancelled",
+              # Этапы отчёта движка и ядра Absorbent.
+              "stage.delivery", "stage.render", "stage.package",
+              "stage.stt", "stage.extract_frames", "stage.select_keyframes",
+              "stage.describe_keyframes", "stage.describe_slides", "stage.prepare_slides",
+              "stage.synthesize", "stage.summarize"]
+    for language in ("ru", "en"):
+        missing = sorted(stage for stage in stages if stage not in catalogues()[language])
+        assert not missing, (language, missing)
+
+
+def test_track_rejects_stage_without_localized_text(tmp_path):
+    """Стадия вне списка не должна попасть ни в состояние черновика, ни в сообщение."""
+    from absorbobot.intake import Intake, STAGES
+
+    class Stub(Intake):
+        def __init__(self):
+            pass
+
+        def _store_import_progress(self, *args, **kwargs):
+            raise AssertionError("прогресс не должен записываться")
+
+    assert "queued" not in STAGES
+
+    async def scenario():
+        async with Stub()._track(1, "uuid", tmp_path, "queued", "bytes"):
+            pass
+
+    with pytest.raises(ValueError):
+        asyncio.run(scenario())
 
 

@@ -34,6 +34,11 @@ class IntakeError(ValueError):
         super().__init__(code)
 
 
+# Стадии приёма в порядке выполнения: у каждой обязателен ключ `input.<стадия>`
+# в обоих языках, потому что движок показывает её в сообщении о прогрессе.
+STAGES = ("media", "external", "telegram", "copy", "analyze")
+
+
 def input_signature(files: list[dict], settings: dict, models: dict) -> str:
     """Сравнить содержимое и обработку без владельца, путей и версии ядра."""
     active = [file for file in files if file.get("active", True) and not file.get("removed")]
@@ -465,6 +470,8 @@ class Intake:
         worker'а или потока копирования и закрывается только при успехе: отмена
         и отказ не выдают ложный финальный прогресс.
         """
+        if stage not in STAGES:
+            raise ValueError(stage)
         tracker = {"stage": stage, "unit": unit, "started_at": utc_now().isoformat(),
                    "completed": 0, "total": total, "last_write": float("-inf")}
         self._store_import_progress(owner, work_uuid, self._progress_value(tracker, 0, total))
@@ -860,7 +867,7 @@ class Intake:
                     temporary.unlink(missing_ok=True)
             if root is not None:
                 # Progress-файлы — внутренний транспорт; в дереве задания не остаются.
-                for stage in ("media", "external", "telegram", "copy", "analyze"):
+                for stage in STAGES:
                     discard_progress(root, stage)
             if completed:
                 self._clear_pending(owner, work_uuid, message_id)

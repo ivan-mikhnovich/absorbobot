@@ -40,6 +40,7 @@
   "work.twitch": "Запись Twitch",
   "work.cached_result": "Сохранённый конспект",
   "input.media": "Скачиваю запись",
+  "input.queued": "Жду начала загрузки",
   "input.external": "Скачиваю файл по ссылке",
   "input.telegram": "Скачиваю вложение Telegram",
   "input.copy": "Сохраняю и проверяю целостность файла",

@@ -6,6 +6,7 @@ import asyncio
 import json
 import os
 import signal
+import sys
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -290,6 +291,29 @@ async def poll(bot: Bot, router: UpdateRouter, stop: asyncio.Event) -> None:
             router.handle(update)
 
 
+_PUBLISH_ERRORS = (TelegramBadRequest, TelegramNetworkError, TelegramRetryAfter, TelegramServerError)
+
+
+async def publish_commands(bot: Bot, dialog: Dialog) -> None:
+    """Опубликовать описания команд, не останавливая службу при отказе Telegram.
+
+    Отказ `setMyCommands` (в том числе ограничение частоты) не влияет на приём
+    сообщений, но при жёсткой обработке превращал перезапуск службы в цикл:
+    каждая новая попытка снова упиралась в предел.
+    """
+    try:
+        for language in ("ru", "en"):
+            commands = dialog.command_descriptions(language)
+            await bot.set_my_commands(
+                [BotCommand(**command) for command in commands],
+                language_code=language,
+            )
+        commands = dialog.command_descriptions("en")
+        await bot.set_my_commands([BotCommand(**command) for command in commands])
+    except _PUBLISH_ERRORS as exc:
+        print(f"Описания команд не опубликованы: {type(exc).__name__}.", file=sys.stderr)
+
+
 async def serve(settings: Settings) -> None:
     """Запустить установленный бот; сначала остановить старые деревья процессов."""
     from absorbobot.engine import Engine
@@ -309,14 +333,7 @@ async def serve(settings: Settings) -> None:
             engine = Engine(settings, store, bot, dialog, core)
             try:
                 await engine.recover()
-                for language in ("ru", "en"):
-                    commands = dialog.command_descriptions(language)
-                    await bot.set_my_commands(
-                        [BotCommand(**command) for command in commands],
-                        language_code=language,
-                    )
-                commands = dialog.command_descriptions("en")
-                await bot.set_my_commands([BotCommand(**command) for command in commands])
+                await publish_commands(bot, dialog)
                 async with asyncio.TaskGroup() as tasks:
                     polling = tasks.create_task(poll(bot, UpdateRouter(store, dialog, admin), stop))
                     outgoing = tasks.create_task(TelegramOutbox(bot, store).run(stop))

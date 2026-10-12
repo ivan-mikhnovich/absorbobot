@@ -40,6 +40,7 @@
   "work.twitch": "Twitch recording",
   "work.cached_result": "Saved notes",
   "input.media": "Downloading the recording",
+  "input.queued": "Waiting for the download to start",
   "input.external": "Downloading the linked file",
   "input.telegram": "Downloading the Telegram attachment",
   "input.copy": "Saving and checking file integrity",
