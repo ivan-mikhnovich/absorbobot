@@ -36,10 +36,10 @@ def runtime(tmp_path):
                                   Admin(store, settings, core))
 
 
-def update(id, sender, text="/start", *, callback=None, group=False):
+def update(id, sender, text="/start", *, callback=None, group=False, username=None):
     message = {"message_id": id, "date": int(datetime.now(timezone.utc).timestamp()),
                "from": {"id": sender, "is_bot": False, "first_name": "User",
-                        "language_code": "ru-RU"},
+                        "language_code": "ru-RU", "username": username},
                "chat": {"id": sender, "type": "group" if group else "private"},
                "text": text}
     if callback:
@@ -424,5 +424,35 @@ def test_delivery_sends_one_album_with_caption_on_the_first_document(tmp_path, c
         assert kwargs["media"][0].caption.startswith("Lecture notes")
         assert all(media.caption is None for media in kwargs["media"][1:])
         assert outbox_result(store, items[0]["id"])["message_id"] == 1001
+
+
+def test_waitlisted_username_is_granted_and_reported_on_first_message(runtime):
+    store, router = runtime
+    store.request_access(1, "Newcomer", "note")
+    assert not store.authorized(2)
+    assert router.handle(update(1, 2, username="Newcomer"))
+    assert store.authorized(2)
+    assert store.get_user(2)["username"] == "Newcomer"
+    assert store.get_user(2)["label"] == "note"
+    assert store.db.execute("SELECT COUNT(*) FROM access_requests").fetchone()[0] == 0
+    notices = [row["payload"]["kwargs"]["text"] for row in store.pending_outbox(100)
+               if row["payload"].get("owner_id") == 1 and "Newcomer" in row["payload"]["kwargs"]["text"]]
+    assert notices
+
+
+def test_unknown_sender_without_waitlist_remains_ignored(runtime):
+    store, router = runtime
+    assert router.handle(update(1, 5, username="stranger"))
+    assert not store.authorized(5)
+    assert store.get_user(5) is None
+    assert not store.pending_outbox(100)
+
+
+def test_waitlisted_username_needs_a_matching_username_not_just_any_sender(runtime):
+    store, router = runtime
+    store.request_access(1, "Newcomer")
+    assert router.handle(update(1, 6))
+    assert not store.authorized(6)
+    assert store.db.execute("SELECT COUNT(*) FROM access_requests").fetchone()[0] == 1
 
 

@@ -21,7 +21,7 @@ from aiogram.types import BotCommand, FSInputFile, InputMediaDocument, Update
 from absorbobot.admin import Admin
 from absorbobot.config import Settings, probe_core
 from absorbobot.dialog import Dialog
-from absorbobot.i18n import language_for
+from absorbobot.i18n import language_for, tr
 from absorbobot.store import Store, _utc, utc_now
 
 
@@ -36,9 +36,14 @@ class UpdateRouter:
             callback = update.callback_query
             message = callback.message if callback else update.message
             sender = callback.from_user if callback else (message.from_user if message else None)
-            if (message is None or sender is None or message.chat.type != "private"
-                    or not self.store.authorized(sender.id)):
+            if message is None or sender is None or message.chat.type != "private":
                 return
+            if not self.store.authorized(sender.id):
+                # Ник из первого сообщения — единственный источник ID для отложенного доступа.
+                granted = None if sender.is_bot else self.store.claim_access(sender.id, sender.username)
+                if granted is None:
+                    return
+                self._access_notice(granted, sender.id)
             self.store.upsert_user(
                 sender.id, username=sender.username,
                 full_name=sender.full_name, language=language_for(sender.language_code),
@@ -57,6 +62,17 @@ class UpdateRouter:
                 if not self.admin.handle_message(payload):
                     self.dialog.handle_message(payload)
         return self.store.process_update(update.update_id, mutate)
+
+    def _access_notice(self, granted: dict, user_id: int) -> None:
+        """Сообщить администратору, что отложенный доступ по нику открыт."""
+        actor = granted["actor_id"]
+        user = self.store.get_user(actor)
+        text = tr((user or {}).get("language", "en"), "admin_access_opened",
+                  username="@" + granted["username"], target=user_id)
+        self.store.add_outbox("telegram", {
+            "owner_id": actor, "method": "send_message",
+            "kwargs": {"chat_id": actor, "text": text},
+        })
 
 
 class TelegramOutbox:

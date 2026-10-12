@@ -357,3 +357,25 @@ def test_dialog_administration_menu_token_requires_configured_admin(admin, store
     other = store.issue_token(ALICE, "admin_menu", "user")
     assert admin.handle_callback(callback(other, ALICE))
     assert len(outgoing(store)) == count
+
+
+def test_allow_known_username_resolves_immediately(admin, store):
+    store.upsert_user(ALICE, username="Alice_W", language="ru")
+    assert admin.handle_message(message("/allow @Alice_W Trusted"))
+    assert store.get_user(ALICE)["label"] == "Trusted"
+    assert store.authorized(ALICE)
+    assert store.db.execute("SELECT COUNT(*) FROM access_requests").fetchone()[0] == 0
+
+
+def test_allow_unknown_username_is_queued_and_t_me_link_is_parsed(admin, store):
+    assert admin.handle_message(message("/allow t.me/Nickname_1 some label"))
+    row = store.db.execute("SELECT * FROM access_requests").fetchone()
+    assert row["username"] == "Nickname_1" and row["actor_id"] == ADMIN and row["label"] == "some label"
+    assert any("Nickname_1" in item["payload"]["kwargs"]["text"] for item in outgoing(store, ADMIN))
+
+
+def test_allow_invalid_username_is_reported_without_side_effects(admin, store):
+    assert admin.handle_message(message("/allow @a"))
+    assert store.db.execute("SELECT COUNT(*) FROM access_requests").fetchone()[0] == 0
+    assert store.get_user(7) is None
+    assert outgoing(store, ADMIN)

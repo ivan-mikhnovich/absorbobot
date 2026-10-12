@@ -132,6 +132,10 @@ CREATE TABLE IF NOT EXISTS durable_tokens (
     action TEXT NOT NULL, target TEXT NOT NULL, payload TEXT NOT NULL,
     created_at TEXT NOT NULL, consumed_at TEXT
 );
+CREATE TABLE IF NOT EXISTS access_requests (
+    username TEXT PRIMARY KEY COLLATE NOCASE, label TEXT,
+    actor_id INTEGER NOT NULL, created_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS process_bindings (
     work_uuid TEXT PRIMARY KEY REFERENCES drafts(id), binding TEXT NOT NULL,
     created_at TEXT NOT NULL
@@ -406,6 +410,45 @@ class Store:
                 (target_id, label, now, now),
             )
             return self.get_user(target_id)
+
+    def find_user_by_username(self, username: str) -> dict[str, Any] | None:
+        """Найти известного пользователя по нику Telegram без учёта регистра."""
+        return self._one("SELECT * FROM users WHERE username=? COLLATE NOCASE "
+                         "ORDER BY updated_at DESC LIMIT 1", (username,))
+
+    def request_access(self, actor_id: int, username: str, label: str | None = None) -> dict:
+        """Разрешить доступ по нику: сразу известному боту или через список ожидания."""
+        with self.transaction():
+            self._admin(actor_id)
+            existing = self.find_user_by_username(username)
+            if existing is not None:
+                self.allow_user(actor_id, existing["id"], label)
+                return {"id": existing["id"], "username": username, "queued": False}
+            self.db.execute(
+                "INSERT INTO access_requests(username,label,actor_id,created_at) VALUES (?,?,?,?) "
+                "ON CONFLICT(username) DO UPDATE SET label=excluded.label,actor_id=excluded.actor_id,"
+                "created_at=excluded.created_at",
+                (username, label, actor_id, _utc()),
+            )
+            return {"id": None, "username": username, "queued": True}
+
+    def claim_access(self, user_id: int, username: str | None) -> dict | None:
+        """Выдать отложенный доступ при первом обращении; иначе None."""
+        if not username:
+            return None
+        with self.transaction():
+            row = self._one("SELECT * FROM access_requests WHERE username=? COLLATE NOCASE", (username,))
+            if row is None:
+                return None
+            now = _utc()
+            self.db.execute("DELETE FROM access_requests WHERE username=?", (row["username"],))
+            self.db.execute(
+                "INSERT INTO users(id,approved,label,created_at,updated_at) VALUES (?,1,?,?,?) "
+                "ON CONFLICT(id) DO UPDATE SET approved=1,"
+                "label=COALESCE(excluded.label,users.label),updated_at=excluded.updated_at",
+                (user_id, row["label"], now, now),
+            )
+            return {"actor_id": row["actor_id"], "username": row["username"], "label": row["label"]}
 
     def ban_user(self, actor_id: int, target_id: int, now_utc: datetime) -> list[dict]:
         with self.transaction():

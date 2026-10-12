@@ -941,3 +941,31 @@ def test_preparation_only_draft_does_not_become_unknown_processing_work(store):
     assert stats["preparation_seconds"]["known_total"] == 2
     assert stats["processing_seconds"] == {"known_total": None, "unknown_works": 0}
     assert stats["render_seconds"] == {"known_total": None, "unknown_works": 0}
+
+
+def test_request_access_resolves_known_username_and_queues_unknown(store):
+    store.upsert_user(ALICE, username="Alice_W", language="ru")
+    resolved = store.request_access(ADMIN, "alice_w", "Trusted")
+    assert resolved == {"id": ALICE, "username": "alice_w", "queued": False}
+    assert store.get_user(ALICE)["label"] == "Trusted"
+    queued = store.request_access(ADMIN, "Ghost_1")
+    assert queued["queued"] and queued["id"] is None
+    assert store.db.execute("SELECT username FROM access_requests").fetchone()[0] == "Ghost_1"
+
+
+def test_claim_access_grants_once_case_insensitively_and_needs_a_username(store):
+    store.request_access(ADMIN, "Newcomer", "Note")
+    assert store.claim_access(9, None) is None
+    assert store.claim_access(9, "someone_else") is None
+    granted = store.claim_access(9, "newcomer")
+    assert granted == {"actor_id": ADMIN, "username": "Newcomer", "label": "Note"}
+    assert store.authorized(9)
+    assert store.get_user(9)["label"] == "Note"
+    assert store.claim_access(9, "Newcomer") is None
+    assert store.db.execute("SELECT COUNT(*) FROM access_requests").fetchone()[0] == 0
+
+
+def test_request_access_requires_an_administrator(store):
+    with pytest.raises(StoreError) as error:
+        store.request_access(ALICE, "Ghost_1")
+    assert error.value.code == "admin_required"

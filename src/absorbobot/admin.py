@@ -24,6 +24,19 @@ def _user_id(text: str) -> int:
     return int(text)
 
 
+_USERNAME = re.compile(r"[A-Za-z][A-Za-z0-9_]{2,31}\Z")
+_USERNAME_LINK = re.compile(r"(?:https?://)?(?:t|telegram)\.me/([A-Za-z][A-Za-z0-9_]{2,31})\Z", re.IGNORECASE)
+
+
+def _username(text: str) -> str:
+    """Разобрать @ник или ссылку t.me/ник в канонический ник без @."""
+    link = _USERNAME_LINK.fullmatch(text)
+    candidate = link.group(1) if link else (text[1:] if text.startswith("@") else text)
+    if not _USERNAME.fullmatch(candidate):
+        raise StoreError("invalid_username")
+    return candidate
+
+
 def _work_id(text: str) -> str:
     try:
         if str(UUID(text)) != text:
@@ -132,12 +145,21 @@ class Admin:
                     target_label = argument.split(maxsplit=1)
                     if not target_label:
                         raise StoreError("invalid_user_id")
-                    target = _user_id(target_label[0])
+                    raw = target_label[0]
                     label = target_label[1] if len(target_label) > 1 else None
                     if label is not None and len(label) > 200:
                         raise StoreError("invalid_arguments")
-                    self.store.allow_user(actor, target, label)
-                    self._send(actor, self._t(actor, "allowed", target=target))
+                    if raw[0].isdigit():
+                        target = _user_id(raw)
+                        self.store.allow_user(actor, target, label)
+                        self._send(actor, self._t(actor, "allowed", target=target))
+                    else:
+                        username = _username(raw)
+                        result = self.store.request_access(actor, username, label)
+                        if result["queued"]:
+                            self._send(actor, self._t(actor, "access_queued", username="@" + result["username"]))
+                        else:
+                            self._send(actor, self._t(actor, "allowed", target=result["id"]))
                 elif command == "ban":
                     self._confirm(actor, "ban", str(_user_id(argument)))
                 elif command in ("job", "purge"):
@@ -190,7 +212,7 @@ class Admin:
         return True
 
     def _error(self, actor: int, error: StoreError):
-        known = {"cannot_ban_admin", "not_found", "work_active", "invalid_uuid", "invalid_user_id", "invalid_arguments", "purge_failed", "safe_purge_unavailable"}
+        known = {"cannot_ban_admin", "not_found", "work_active", "invalid_uuid", "invalid_user_id", "invalid_username", "invalid_arguments", "purge_failed", "safe_purge_unavailable"}
         self._send(actor, self._t(actor, "error_" + (error.code if error.code in known else "unavailable")))
 
     def _view(self, actor: int, section: str, page: int = 0):
@@ -242,6 +264,11 @@ class Admin:
             keyboard.append([self._button(actor, "user_stats", "admin_view", "stats:" + str(user["id"]))])
             if not self.store.is_admin(user["id"]):
                 keyboard.append([self._button(actor, "ban" if user["approved"] else "allow", "admin_prompt" if user["approved"] else "admin_allow", "ban" if user["approved"] else str(user["id"]), **({"target": str(user["id"])} if user["approved"] else {}))])
+        requests = self.store.db.execute(
+            "SELECT username FROM access_requests ORDER BY created_at LIMIT ?", (PAGE_SIZE,)
+        ).fetchall()
+        for request in requests:
+            text.append(self._t(actor, "access_queue_row", username="@" + request["username"]))
         if not rows:
             text.append(self._t(actor, "empty"))
         self._send(actor, "\n\n".join(text), keyboard + self._pages(actor, "users", page, len(rows) > PAGE_SIZE))
