@@ -28,6 +28,7 @@ class MediaError(ValueError):
 
 
 VIDEO_ID = re.compile(r"[A-Za-z0-9_-]{11}")
+VK_VIDEO_ID = re.compile(r"-?\d{1,20}_\d{1,20}")
 _VIDEO_HEIGHT = 1080
 
 
@@ -71,6 +72,34 @@ def _parse_youtube(value: str) -> tuple[str, str]:
         raise MediaError("invalid_media_url") from None
 
 
+_VK_HOSTS = frozenset({"vk.com", "m.vk.com", "new.vk.com", "vk.ru", "m.vk.ru",
+                       "vkvideo.ru", "m.vkvideo.ru"})
+
+
+def _parse_vk(value: str) -> tuple[str, str]:
+    """Разобрать только публичные HTTPS-ссылки на одну запись VK Video."""
+    try:
+        if not isinstance(value, str) or any(c.isspace() or ord(c) < 32 for c in value):
+            raise ValueError
+        parsed = urlsplit(value)
+        if (parsed.scheme != "https" or parsed.username is not None
+                or parsed.password is not None or parsed.fragment
+                or parsed.hostname not in _VK_HOSTS or parsed.port not in (None, 443)):
+            raise ValueError
+        # Плейлисты, метки и escaped-пути не поддерживаются: нужна одна запись.
+        if "%" in parsed.path or "\\" in parsed.netloc or "\\" in parsed.path or parsed.query:
+            raise ValueError
+        parts = parsed.path.split("/")
+        if len(parts) != 2 or not parts[1].startswith("video"):
+            raise ValueError
+        media_id = parts[1][len("video"):]
+        if not VK_VIDEO_ID.fullmatch(media_id):
+            raise ValueError
+        return "https://vk.com/video" + media_id, media_id
+    except (ValueError, TypeError, AttributeError):
+        raise MediaError("invalid_media_url") from None
+
+
 def _check_youtube(info: dict) -> None:
     """Не начинать загрузку эфира, премьеры или закрытой записи."""
     if (info.get("is_live") or info.get("is_upcoming")
@@ -78,6 +107,12 @@ def _check_youtube(info: dict) -> None:
         raise MediaError("media_live")
     if info.get("availability") not in (None, "public", "unlisted"):
         raise MediaError("media_unavailable")
+
+
+def _check_vk(info: dict) -> None:
+    """Не начинать загрузку идущей трансляции VK."""
+    if info.get("is_live") or info.get("live_status") not in (None, "not_live", "was_live"):
+        raise MediaError("media_live")
 
 
 class Platform(NamedTuple):
@@ -101,11 +136,17 @@ _PLATFORMS = (
              formats={"video": f"bv[height<={_VIDEO_HEIGHT}]+ba/b[height<={_VIDEO_HEIGHT}]",
                       "audio": "bestaudio"},
              parse=_parse_youtube, check=_check_youtube),
+    Platform(name="vk", keys=frozenset({"VK"}),
+             extractors=("yt_dlp.extractor.vk.VKIE",),
+             formats={"video": f"bv*[height<={_VIDEO_HEIGHT}]+ba/b[height<={_VIDEO_HEIGHT}]",
+                      "audio": "bestaudio/best"},
+             parse=_parse_vk, check=_check_vk),
 )
 
 # Служебная подпись площадки в имени записи и ключ её названия в интерфейсе.
 LABELS: dict[str, tuple[str, str]] = {
     "youtube": ("YouTube", "work.youtube"),
+    "vk": ("VK Video", "work.vk"),
 }
 
 

@@ -23,6 +23,8 @@ from absorbobot.workers.media import (
 
 CANONICAL = "https://www.youtube.com/watch?v=abcdefghijk"
 VIDEO = "abcdefghijk"
+VK_CANONICAL = "https://vk.com/video-77521_162222515"
+VK_ID = "-77521_162222515"
 
 
 def platform_of(url: str):
@@ -31,11 +33,19 @@ def platform_of(url: str):
 
 
 YOUTUBE = platform_of(CANONICAL)
+VK = platform_of(VK_CANONICAL)
 
 
 def metadata(**fields):
     base = {"id": VIDEO, "_type": "video", "live_status": "not_live",
             "duration": 100, "availability": "public", "extractor_key": "Youtube"}
+    base.update(fields)
+    return base
+
+
+def vk_metadata(**fields):
+    # Метаданные VKIE: идентификатор из URL, is_live вместо live_status и availability.
+    base = {"id": VK_ID, "duration": 195, "extractor_key": "VK", "is_live": False}
     base.update(fields)
     return base
 
@@ -87,7 +97,60 @@ def test_normalize_rejects_userinfo_ports_playlists_and_fake_hosts(value):
     assert str(error.value) == "invalid_media_url"
 
 
+@pytest.mark.parametrize("value,expected", [
+    ("https://vk.com/video-77521_162222515", VK_CANONICAL),
+    ("https://m.vk.com/video-77521_162222515", VK_CANONICAL),
+    ("https://new.vk.com/video-77521_162222515", VK_CANONICAL),
+    ("https://vk.ru/video-77521_162222515", VK_CANONICAL),
+    ("https://vkvideo.ru/video-77521_162222515", VK_CANONICAL),
+    ("https://m.vkvideo.ru/video-77521_162222515", VK_CANONICAL),
+    # Идентификатор без знака владельца — запись личной страницы.
+    ("https://vk.com/video205387401_165548505", "https://vk.com/video205387401_165548505"),
+])
+def test_normalize_accepts_canonical_vk_video_forms(value, expected):
+    assert normalize_media_url(value) == expected
+
+
+@pytest.mark.parametrize("value", [
+    None,
+    42,
+    "",
+    "http://vk.com/video-77521_162222515",
+    "ftp://vk.com/video-77521_162222515",
+    "https://user@vk.com/video-77521_162222515",
+    "https://user:pass@vkvideo.ru/video-77521_162222515",
+    "https://vk.com:8443/video-77521_162222515",
+    "https://vk.com/video-77521_162222515#t=30",
+    # Плейлист, альбом и метка времени выбирают не одну запись.
+    "https://vk.com/video-77521_162222515?list=ln-cBjJ7S4jYYx3ADnmDT",
+    "https://vk.com/videos-77521?z=video-77521_162222515",
+    "https://vk.com/video-77521_162222515?t=30",
+    # Встраиваемая ссылка требует hash и не является публичной формой записи.
+    "https://vk.com/video_ext.php?oid=-77521&id=162222515&hash=87b046504ccd8bfa",
+    # Клип — не запись лекции, а контейнер ссылки отдаёт чужой результат.
+    "https://vk.com/clip-77521_162222515",
+    "https://vk.com/video-77521",
+    "https://vk.com/video-77521_",
+    "https://vk.com/video-77521_162222515/extra",
+    "https://vk.com/video-77521_162222515/",
+    "https://vk.com/",
+    "https://evil.example/video-77521_162222515",
+    "https://vk.com.evil.example/video-77521_162222515",
+    "https://vk.com/video-77521_162222515 ",
+    "https://vk.com/%76ideo-77521_162222515",
+    # Формы чужой площадки на узле VK не разбирает ни один парсер.
+    "https://vk.com/watch?v=abcdefghijk",
+])
+def test_normalize_rejects_vk_ambiguous_and_foreign_links(value):
+    with pytest.raises(MediaError) as error:
+        normalize_media_url(value)
+    assert str(error.value) == "invalid_media_url"
+
+
 def test_resolve_reports_platform_canonical_url_and_identity():
+    platform, url, media_id = resolve_media_url("https://m.vk.com/video-77521_162222515?")
+    assert platform.name == "vk"
+    assert (url, media_id) == (VK_CANONICAL, VK_ID)
     platform, url, media_id = resolve_media_url("https://youtu.be/abcdefghijk")
     assert platform.name == "youtube"
     assert (url, media_id) == (CANONICAL, VIDEO)
@@ -95,9 +158,12 @@ def test_resolve_reports_platform_canonical_url_and_identity():
 
 def test_placeholder_names_carry_platform_and_stay_recognizable():
     assert placeholder_name("https://youtu.be/abcdefghijk") == "YouTube abcdefghijk"
+    assert placeholder_name(VK_CANONICAL) == "VK Video -77521_162222515"
     assert placeholder_platform("YouTube abcdefghijk") == "youtube"
+    assert placeholder_platform("VK Video -77521_162222515") == "vk"
     assert placeholder_platform("Lecture one") is None
     assert placeholder_platform("YouTube") is None
+    assert platform_label("vk") == "work.vk"
     assert platform_label("youtube") == "work.youtube"
     assert platform_label(None) == "work.lecture"
 
@@ -135,6 +201,28 @@ def test_validate_metadata_accepts_known_finite_not_live_video():
 def test_validate_metadata_rejects_live_private_and_unknown(fields, code):
     with pytest.raises(MediaError) as error:
         validate_metadata(metadata(**fields), VIDEO, 14400, YOUTUBE)
+    assert str(error.value) == code
+
+
+def test_validate_metadata_accepts_vk_video_without_live_status():
+    # VKIE не сообщает live_status и availability: проверка опирается на is_live.
+    assert validate_metadata(vk_metadata(duration=195, title="Lecture"),
+                             VK_ID, 14400, VK) == {"duration": 195, "title": "Lecture"}
+
+
+@pytest.mark.parametrize("fields,code", [
+    ({"is_live": True}, "media_live"),
+    ({"live_status": "is_live"}, "media_live"),
+    ({"id": "205387401_165548505"}, "invalid_media_metadata"),
+    ({"extractor_key": "Youtube"}, "invalid_media_metadata"),
+    ({"_type": "url"}, "invalid_media_metadata"),
+    ({"entries": [{}]}, "invalid_media_metadata"),
+    ({"duration": None}, "invalid_duration"),
+    ({"duration": 14401}, "media_too_long"),
+])
+def test_validate_vk_metadata_rejects_live_foreign_and_unknown(fields, code):
+    with pytest.raises(MediaError) as error:
+        validate_metadata(vk_metadata(**fields), VK_ID, 14400, VK)
     assert str(error.value) == code
 
 
@@ -184,16 +272,18 @@ def test_tree_bytes_counts_files_and_rejects_specials(tmp_path):
     assert str(error.value) == "unsafe_file_path"
 
 
-@pytest.mark.parametrize("url", ["short", "https://youtu.be/abcdefghij"])
+@pytest.mark.parametrize("url", ["short", "https://youtu.be/abcdefghij", "https://vk.com/video-1",
+                                 "https://vk.com/clip-77521_162222515"])
 def test_download_refuses_unknown_url_before_filesystem(url):
     with pytest.raises(MediaError) as error:
         download(url, "video", 10, 10, 10, 10)
     assert str(error.value) == "invalid_media_url"
 
 
-def test_download_refuses_unknown_mode_before_filesystem():
+@pytest.mark.parametrize("url", [CANONICAL, VK_CANONICAL])
+def test_download_refuses_unknown_mode_before_filesystem(url):
     with pytest.raises(MediaError) as error:
-        download(CANONICAL, "both", 10, 10, 10, 10)
+        download(url, "both", 10, 10, 10, 10)
     assert str(error.value) == "invalid_media_url"
 
 

@@ -406,6 +406,8 @@ def test_handle_propagates_paused_and_keeps_pending(env):
 @pytest.mark.parametrize("link,mode,canonical,name", [
     ("https://youtu.be/abcdefghijk", "audio", "https://www.youtube.com/watch?v=abcdefghijk",
      "YouTube abcdefghijk.m4a"),
+    ("https://vkvideo.ru/video-77521_162222515", "video", "https://vk.com/video-77521_162222515",
+     "VK Video -77521_162222515.mkv"),
 ])
 def test_handle_media_import_keeps_ready_and_records_mode(env, link, mode, canonical, name):
     store, intake, sandbox = env
