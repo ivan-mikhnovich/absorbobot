@@ -1,4 +1,4 @@
-"""Команды проверки, запуска и генерации двух собственных user units."""
+"""Команды проверки, запуска и установки собственных user units."""
 
 from __future__ import annotations
 
@@ -19,7 +19,7 @@ from absorbobot.config import ConfigError, Settings, check_runtime, check_storag
 
 
 async def check_telegram(settings: Settings, env: dict[str, str]) -> dict:
-    """Проверить только getMe локального API, не отправляя сообщений."""
+    """Проверить только getMe выбранного API, не отправляя сообщений."""
     token = env.get("ABSORBOBOT_TOKEN")
     if not token:
         raise ConfigError("Не задана переменная ABSORBOBOT_TOKEN.")
@@ -29,7 +29,8 @@ async def check_telegram(settings: Settings, env: dict[str, str]) -> dict:
     from aiogram.exceptions import TelegramUnauthorizedError
     from aiogram.utils.token import TokenValidationError
 
-    session = AiohttpSession(api=TelegramAPIServer.from_base(settings.bot_api_url, is_local=True), timeout=30)
+    session = AiohttpSession(api=TelegramAPIServer.from_base(
+        settings.bot_api_url, is_local=settings.bot_api_url != "https://api.telegram.org"), timeout=30)
     try:
         bot = Bot(token=token, session=session)
         me = await bot.get_me()
@@ -41,7 +42,7 @@ async def check_telegram(settings: Settings, env: dict[str, str]) -> dict:
     except ConfigError:
         raise
     except Exception:
-        raise ConfigError("Не удалось выполнить getMe локального Telegram Bot API.") from None
+        raise ConfigError("Не удалось выполнить getMe Telegram Bot API.") from None
     finally:
         await session.close()
 
@@ -64,6 +65,16 @@ def render_units(settings: Settings, *, uv_binary: str | Path | None = None) -> 
     if uv is None or not Path(uv).is_absolute():
         raise ConfigError("Не найден абсолютный путь исполняемого uv.")
     pre = _exec([uv, "tool", "run", "--offline", "--no-config", "absorbobot", "check-storage", "--config", settings.config_path])
+    if settings.bot_api_url == "https://api.telegram.org":
+        bot = _exec([uv, "tool", "run", "--offline", "--no-config", "absorbobot", "serve", "--config", settings.config_path])
+        return {"absorbobot.service": (
+            "[Unit]\nDescription=Absorbobot\n\n[Service]\nType=simple\n"
+            f"WorkingDirectory={str(settings.state_dir).replace('%', '%%')}\n"
+            f"EnvironmentFile={str(settings.secrets_file).replace('%', '%%')}\n"
+            f"ExecStartPre={pre}\nExecStart={bot}\n"
+            "UMask=0077\nKillMode=control-group\nTimeoutStopSec=15s\nRestart=on-failure\n"
+            "\n[Install]\nWantedBy=default.target\n"
+        )}
     # Каталог моделей динамический; native API не должен получать bot/cloud ключи.
     try:
         raw = yaml.safe_load(settings.absorbent_config.read_text(encoding="utf-8"))
@@ -129,22 +140,36 @@ def check_unit_paths(settings: Settings) -> None:
             actual = (directory / name).read_text(encoding="utf-8")
         except (OSError, UnicodeError):
             raise ConfigError("Не удалось проверить собственные user units.") from None
-        if actual != expected[name]:
+        if name not in expected or actual != expected[name]:
             raise ConfigError("User units не соответствуют текущим настройкам; выполните install-units.")
 
 
 def install_units(settings: Settings) -> None:
-    """Записать только две собственные службы и выполнить daemon-reload."""
+    """Записать собственные службы выбранного API и выполнить daemon-reload."""
     check_storage(settings)
     units = render_units(settings)
-    for path in (settings.state_dir, settings.state_dir / "telegram-api",
-                 settings.storage_dir, settings.storage_dir / "telegram-api-files",
-                 settings.storage_dir / "telegram-api-tmp"):
+    paths = [settings.state_dir, settings.storage_dir]
+    if settings.bot_api_url != "https://api.telegram.org":
+        paths.extend((settings.state_dir / "telegram-api", settings.storage_dir / "telegram-api-files",
+                      settings.storage_dir / "telegram-api-tmp"))
+    for path in paths:
         if path.is_symlink():
             raise ConfigError("Каталог собственной службы является небезопасной ссылкой.")
         path.mkdir(parents=True, exist_ok=True, mode=0o700)
     directory = unit_directory()
     directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    obsolete = directory / "absorbobot-api.service"
+    if settings.bot_api_url == "https://api.telegram.org" and obsolete.exists():
+        if obsolete.is_symlink():
+            raise ConfigError("Собственный unit является небезопасной ссылкой.")
+        try:
+            stopped = subprocess.run(["systemctl", "--user", "disable", "--now", "absorbobot-api.service"],
+                                     capture_output=True, timeout=30, check=False)
+        except (OSError, subprocess.TimeoutExpired):
+            raise ConfigError("Не удалось остановить собственный локальный Bot API.") from None
+        if stopped.returncode:
+            raise ConfigError("Не удалось отключить собственный локальный Bot API.")
+        obsolete.unlink()
     for name, content in units.items():
         target = directory / name
         if target.is_symlink():

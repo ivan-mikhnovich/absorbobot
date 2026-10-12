@@ -22,6 +22,7 @@ from .i18n import tr
 from .metrics import aggregate_reports
 from .store import StoreError, utc_now
 from .workers.youtube import YouTubeError, normalize_youtube_url, tree_bytes
+from .workers.external import normalize_external_url
 
 
 class IntakeError(ValueError):
@@ -291,6 +292,7 @@ _ERROR_CODES = frozenset({
     "missing_audio", "invalid_material", "material_pages_exceeded", "analysis_failed",
     "invalid_youtube_url", "invalid_youtube_metadata", "youtube_live", "youtube_unavailable",
     "youtube_failed", "telegram_file_unavailable", "media_exists", "source_first",
+    "invalid_url", "unsafe_url", "download_failed", "telegram_file_too_large",
     "cancelled", "timeout", "sandbox_unavailable", "handshake_failed", "invalid_runtime",
     "interrupted",
 })
@@ -433,12 +435,45 @@ class Intake:
             raise IntakeError("input_too_large")
         return limit, remaining
 
+    async def _download_telegram(self, remote_path: str, target: Path, root: Path, limit: int) -> None:
+        """Скачать cloud-вложение ограниченными блоками без токена в журнале."""
+        if (not re.fullmatch(r"[A-Za-z0-9_/-]+\.[A-Za-z0-9]+", remote_path)
+                or remote_path.startswith("/") or ".." in remote_path.split("/")):
+            raise IntakeError("unsafe_file_path")
+        existing, size = tree_bytes(root), 0
+        try:
+            fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+            with os.fdopen(fd, "wb") as output:
+                url = self.bot.session.api.file_url(self.bot.token, remote_path)
+                async with asyncio.timeout(min(600, self.settings.max_processing_seconds)):
+                    async for chunk in self.bot.session.stream_content(
+                            url, timeout=600, chunk_size=65536, raise_for_status=True):
+                        size += len(chunk)
+                        if size > limit:
+                            raise IntakeError("telegram_file_too_large" if size > 20000000 else "input_too_large")
+                        if existing + size > self.settings.max_work_bytes:
+                            raise IntakeError("work_limit")
+                        usage = os.statvfs(root)
+                        if usage.f_bavail * usage.f_frsize - len(chunk) < self.settings.min_free_bytes:
+                            raise IntakeError("storage_unavailable")
+                        output.write(chunk)
+                output.flush()
+                os.fsync(output.fileno())
+            if not size:
+                raise IntakeError("invalid_file_metadata")
+        except BaseException as exc:
+            target.unlink(missing_ok=True)
+            if isinstance(exc, (IntakeError, asyncio.CancelledError)):
+                raise
+            raise IntakeError("timeout" if isinstance(exc, TimeoutError) else "telegram_file_unavailable") from None
+
     async def handle(self, payload: dict) -> dict:
         owner, work_uuid, message = payload["owner_id"], payload["draft_id"], payload["message"]
         message_id = message.get("message_id")
         if type(message_id) is not int or message_id <= 0:
             raise IntakeError("invalid_file_metadata")
-        completed, preparing, youtube = True, False, bool(message.get("text"))
+        completed, preparing, youtube, external = True, False, False, False
+        cleanup: list[Path] = []
         try:
             if not self.store.authorized(owner):
                 return {"status": "skipped", "reason": "access_revoked"}
@@ -449,8 +484,14 @@ class Intake:
             existing = next((file for file in files if not file["removed"] and file["source_message_id"] == message_id), None)
             if existing:
                 return {"status": "imported", "file_id": existing["id"], "duplicate": True}
+            if message.get("text"):
+                try:
+                    url = normalize_youtube_url(message["text"])
+                    youtube = True
+                except YouTubeError:
+                    url = normalize_external_url(message["text"])
+                    external = True
             if youtube:
-                url = normalize_youtube_url(message["text"])
                 mode = message.get("youtube_mode", payload.get("youtube_mode", draft["settings"].get("youtube_mode", "video")))
                 if mode not in ("video", "audio"):
                     raise IntakeError("invalid_youtube_url")
@@ -459,9 +500,14 @@ class Intake:
                     raise IntakeError("unsupported_input")
                 descriptor = {"role": "media", "bytes": 0, "extension": extension,
                               "original_name": "YouTube " + url.rsplit("=", 1)[1] + extension}
+            elif external:
+                descriptor = None
             else:
                 descriptor = telegram_descriptor(message, self.core)
-            limit, remaining_pages = self._limits(files, descriptor["role"], descriptor["bytes"])
+                if self.settings.bot_api_url == "https://api.telegram.org" and descriptor["bytes"] > 20000000:
+                    raise IntakeError("telegram_file_too_large")
+            if descriptor is not None:
+                limit, remaining_pages = self._limits(files, descriptor["role"], descriptor["bytes"])
             # Предел metadata проверен до getFile, mount — до любого mkdir.
             check_storage(self.settings)
             root = create_work_tree(self.settings, work_uuid)
@@ -485,6 +531,46 @@ class Intake:
                     if relative.is_absolute() or ".." in relative.parts or not relative.parts or relative.parts[0] != "tmp":
                         raise IntakeError("unsafe_file_path")
                     source, source_root = root / relative, root / "tmp"
+            elif external:
+                runtime = {"tool_env": sys.prefix, "python_executable": sys.executable,
+                           "python_base_prefix": sys.base_prefix}
+                material_bytes = sum(file["bytes"] for file in files if file["role"] == "material" and not file["removed"])
+                request = root / "tmp" / (uuid4().hex + ".json")
+                download_id = request.stem
+                cleanup.extend(root / "tmp" / (download_id + extension)
+                               for extension in _extensions(self.core["media_extensions"]) | _extensions(self.core["material_extensions"]))
+                with request.open("x", encoding="utf-8") as handle:
+                    os.chmod(request, 0o600)
+                    json.dump({"url": url, "download_id": download_id, "media_extensions": self.core["media_extensions"],
+                               "material_extensions": self.core["material_extensions"],
+                               "max_media_bytes": self.settings.max_media_bytes,
+                               "max_material_bytes": self.settings.max_material_bytes,
+                               "remaining_material_bytes": max(0, self.settings.max_material_bytes - material_bytes),
+                               "max_work_bytes": self.settings.max_work_bytes,
+                               "min_free_bytes": self.settings.min_free_bytes}, handle)
+                cleanup.append(request)
+                async with self._operation(owner, work_uuid, "external") as outcome:
+                    result = await self.sandbox.run(
+                        work_uuid, "external", [sys.executable, "/workers/external.py", "/work/tmp/" + request.name],
+                        runtime=runtime, env={}, network=True, selected_key_names=(),
+                        timeout=min(600, self.settings.max_processing_seconds))
+                    outcome["resources"] = _phase_resources(result.get("resource_report"), "input_external")
+                    data = _worker_result(result)
+                    relative = Path(data.get("relative_path", ""))
+                    if (relative.is_absolute() or ".." in relative.parts or len(relative.parts) != 2
+                            or relative.parts[0] != "tmp" or relative.stem != download_id):
+                        raise IntakeError("unsafe_file_path")
+                    source, source_root = root / relative, root / "tmp"
+                    if source not in cleanup:
+                        raise IntakeError("unsafe_file_path")
+                    role, extension, size = data.get("role"), data.get("extension"), data.get("bytes")
+                    if (role not in ("media", "material") or type(size) is not int or size <= 0
+                            or extension not in _extensions(self.core[role + "_extensions"])
+                            or not isinstance(data.get("original_name"), str)):
+                        raise IntakeError("invalid_file_metadata")
+                    descriptor = {"role": role, "extension": extension, "bytes": size,
+                                  "original_name": data["original_name"]}
+                    limit, remaining_pages = self._limits(files, role, size)
             else:
                 try:
                     remote = await self.bot.get_file(descriptor["file_id"])
@@ -496,7 +582,15 @@ class Intake:
                     raise IntakeError("input_too_large")
                 if not isinstance(remote_path, str) or not remote_path:
                     raise IntakeError("unsafe_file_path")
-                source, source_root = Path(remote_path), self.settings.storage_dir / "telegram-api-files"
+                if self.settings.bot_api_url == "https://api.telegram.org":
+                    source, source_root = root / "tmp" / (uuid4().hex + descriptor["extension"]), root / "tmp"
+                    cleanup.append(source)
+                    limit = min(limit, 20000000)
+                    async with self._operation(owner, work_uuid, "telegram") as outcome:
+                        await self._download_telegram(remote_path, source, root, limit)
+                        outcome["resources"] = _missing_resources("input_telegram")
+                else:
+                    source, source_root = Path(remote_path), self.settings.storage_dir / "telegram-api-files"
             self._draft(owner, work_uuid)
             target = root / "input" / (uuid4().hex + descriptor["extension"])
             async with self._operation(owner, work_uuid, "copy") as outcome:
@@ -570,6 +664,9 @@ class Intake:
             self._notice(owner, work_uuid, message_id, "intake.error." + code)
             return {"status": "rejected", "reason": code, "work_uuid": work_uuid}
         finally:
+            for temporary in cleanup:
+                with contextlib.suppress(OSError):
+                    temporary.unlink(missing_ok=True)
             if completed:
                 self._clear_pending(owner, work_uuid, message_id)
 

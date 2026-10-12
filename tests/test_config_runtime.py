@@ -12,7 +12,7 @@ def runtime(monkeypatch, tmp_path):
     binary = tmp_path / "telegram-bot-api"
     binary.write_text("binary")
     binary.chmod(0o700)
-    settings = config.Settings(storage_dir=tmp_path / "mount/data", backing_mount=tmp_path / "mount", state_dir=tmp_path / "state", api_binary=binary)
+    settings = config.Settings(storage_dir=tmp_path / "mount/data", backing_mount=tmp_path / "mount", state_dir=tmp_path / "state", api_binary=binary, bot_api_url="http://127.0.0.1:8081")
     env = {"ABSORBOBOT_TOKEN": "private-token", "TELEGRAM_API_ID": "12345", "TELEGRAM_API_HASH": "a" * 32, "SELECTED_KEY": "private-model-key"}
     core = {"models": {}, "defaults": {}, "runtime": {"tex_roots": ["/etc/texmf"]}}
     for category in ("stt", "vision", "llm"):
@@ -85,3 +85,13 @@ def test_unknown_tex_roots_blocks_serve(runtime):
 def test_snapshot_cannot_borrow_telegram_key():
     with pytest.raises(config.ConfigError):
         config.require_key_names({"llm": {"provider": {"api_key_env": "ABSORBOBOT_TOKEN"}}}, {"ABSORBOBOT_TOKEN": "private"})
+
+
+def test_cloud_preflight_requires_no_application_credentials_or_native_binary(runtime):
+    from dataclasses import replace
+    settings, core, env = runtime
+    settings.api_binary.unlink()
+    del env["TELEGRAM_API_ID"]
+    del env["TELEGRAM_API_HASH"]
+    cloud = replace(settings, bot_api_url="https://api.telegram.org")
+    assert config.check_runtime(cloud)["core"] is core

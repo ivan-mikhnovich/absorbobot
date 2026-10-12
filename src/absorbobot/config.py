@@ -33,14 +33,14 @@ class Settings:
     storage_dir: Path = Path("/media/storage/absorbobot")
     state_dir: Path = Path("~/.local/state/absorbobot")
     absorbent_config: Path = Path("~/.config/absorbent/config.yaml")
-    bot_api_url: str = "http://127.0.0.1:8081"
+    bot_api_url: str = "https://api.telegram.org"
     quota_jobs: int = 10
     quota_window_seconds: int = 86400
     max_media_bytes: int = 2000000000
     max_media_seconds: int = 14400
     max_material_bytes: int = 100000000
     max_material_pages: int = 100
-    telegram_part_bytes: int = 1900000000
+    telegram_part_bytes: int = 49000000
     min_free_bytes: int = 50000000000
     max_work_bytes: int = 100000000000
     max_processing_seconds: int = 21600
@@ -80,8 +80,9 @@ class Settings:
             raise ConfigError("state_dir должен находиться на SSD вне backing_mount.")
         if self.secrets_file.resolve().is_relative_to(mount):
             raise ConfigError("secrets_file должен находиться на SSD вне backing_mount.")
-        if self.telegram_part_bytes > 2000000000:
-            raise ConfigError("telegram_part_bytes превышает предел локального Bot API.")
+        maximum = 2000000000 if self.bot_api_url != "https://api.telegram.org" else 50000000
+        if self.telegram_part_bytes > maximum:
+            raise ConfigError("telegram_part_bytes превышает предел выбранного Bot API.")
 
 
 _PATH_FIELDS = ("storage_dir", "state_dir", "absorbent_config", "backing_mount", "secrets_file", "api_binary", "config_path")
@@ -92,6 +93,8 @@ _REQUIRED_TOOLS = ("uv", "bwrap", "ffmpeg", "ffprobe", "pdfinfo", "pdftoppm", "s
 
 
 def _validate_api_url(value: str) -> None:
+    if value == "https://api.telegram.org":
+        return
     try:
         if not isinstance(value, str) or any(c in value for c in ("\n", "\r", "\t", "\x00")):
             raise ValueError
@@ -103,7 +106,7 @@ def _validate_api_url(value: str) -> None:
     except (TypeError, ValueError):
         valid = False
     if not valid:
-        raise ConfigError("bot_api_url должен быть HTTP loopback адресом на порту 8081 без credentials, пути или параметров.")
+        raise ConfigError("bot_api_url должен быть https://api.telegram.org или HTTP loopback адресом на порту 8081 без credentials, пути или параметров.")
 
 
 def load_settings(path: str | Path) -> Settings:
@@ -394,7 +397,8 @@ def check_runtime(settings: Settings) -> dict:
     for tool in _REQUIRED_TOOLS:
         if not shutil.which(tool):
             raise ConfigError(f"Не установлен необходимый инструмент {tool}.")
-    if not settings.api_binary.is_file() or not os.access(settings.api_binary, os.X_OK):
+    local_api = settings.bot_api_url != "https://api.telegram.org"
+    if local_api and (not settings.api_binary.is_file() or not os.access(settings.api_binary, os.X_OK)):
         raise ConfigError("Не установлен исполняемый telegram-bot-api по api_binary.")
     state = settings.state_dir.resolve()
     existing = _existing_parent(state)
@@ -405,10 +409,11 @@ def check_runtime(settings: Settings) -> dict:
         raise ConfigError("SQLite state_dir должен находиться на поддерживаемой SSD файловой системе, не NTFS.")
     core = probe_core(settings)
     env = load_secrets(settings)
-    for name in ("ABSORBOBOT_TOKEN", "TELEGRAM_API_ID", "TELEGRAM_API_HASH"):
+    required = ("ABSORBOBOT_TOKEN", "TELEGRAM_API_ID", "TELEGRAM_API_HASH") if local_api else ("ABSORBOBOT_TOKEN",)
+    for name in required:
         if not env.get(name):
             raise ConfigError(f"Не задана переменная {name}.")
-    if not env["TELEGRAM_API_ID"].isdigit() or int(env["TELEGRAM_API_ID"]) <= 0 or not re.fullmatch(r"[0-9a-fA-F]{32}", env["TELEGRAM_API_HASH"]):
+    if local_api and (not env["TELEGRAM_API_ID"].isdigit() or int(env["TELEGRAM_API_ID"]) <= 0 or not re.fullmatch(r"[0-9a-fA-F]{32}", env["TELEGRAM_API_HASH"])):
         raise ConfigError("Некорректные application credentials Telegram.")
     selected = {category: core["models"][category][core["defaults"][category]] for category in ("stt", "vision", "llm")}
     require_key_names(selected, env)

@@ -239,7 +239,8 @@ async def serve(settings: Settings) -> None:
     from absorbobot.engine import Engine
 
     core = probe_core(settings)
-    session = AiohttpSession(api=TelegramAPIServer.from_base(settings.bot_api_url, is_local=True))
+    session = AiohttpSession(api=TelegramAPIServer.from_base(
+        settings.bot_api_url, is_local=settings.bot_api_url != "https://api.telegram.org"))
     bot = Bot(os.environ["ABSORBOBOT_TOKEN"], session=session)
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()

@@ -5,15 +5,14 @@ backing_mount: /media/storage
 state_dir: ~/.local/state/absorbobot
 absorbent_config: ~/.config/absorbent/config.yaml
 secrets_file: ~/.config/absorbobot/secrets.env
-api_binary: ~/.local/libexec/absorbobot/bin/telegram-bot-api
-bot_api_url: http://127.0.0.1:8081
+bot_api_url: https://api.telegram.org
 quota_jobs: 10
 quota_window_seconds: 86400
 max_media_bytes: 2000000000
 max_media_seconds: 14400
 max_material_bytes: 100000000
 max_material_pages: 100
-telegram_part_bytes: 1900000000
+telegram_part_bytes: 49000000
 min_free_bytes: 50000000000
 max_work_bytes: 100000000000
 max_processing_seconds: 21600

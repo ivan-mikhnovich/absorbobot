@@ -12,6 +12,7 @@ from pathlib import PurePath
 from .i18n import tr
 from .store import StoreError, QuotaError
 from .workers.youtube import YouTubeError, normalize_youtube_url
+from .workers.external import normalize_external_url
 
 
 COMMANDS = ('start', 'new', 'jobs', 'settings', 'language', 'help', 'cancel', 'stats', 'version')
@@ -192,11 +193,17 @@ class Dialog:
         if draft['status'] == 'preparing' or draft['close_requested']:
             self._send(owner, tr(self._language(owner), 'dialog.preparing'))
             return
+        youtube, external = False, False
         if message.get('text'):
             try:
                 normalize_youtube_url(message['text'])
+                youtube = True
             except YouTubeError:
-                raise StoreError('unsupported_input') from None
+                try:
+                    normalize_external_url(message['text'])
+                    external = True
+                except ValueError:
+                    raise StoreError('unsupported_input') from None
         state = dict(draft['ui_state'])
         source = self._source(message)
         pending = state.get('pending_import_ids', [])
@@ -205,7 +212,7 @@ class Dialog:
         extension = PurePath(document.get('file_name', '')).suffix.lower()
         material_exts = {str(ext).lower() if str(ext).startswith('.') else '.' + str(ext).lower() for ext in self.core['material_extensions']}
         is_material = bool(message.get('photo') or extension in material_exts)
-        if has_source and not is_material:
+        if has_source and not is_material and not external:
             self._send(owner, tr(self._language(owner), 'dialog.second_source'), [[self._button(owner, 'button.replace', 'new_confirm', draft['id']), self._button(owner, 'button.files_added', 'files_added', draft['id'])]])
             return
         if not has_source:
@@ -216,7 +223,7 @@ class Dialog:
             ids = list(draft['source_message_ids'])
             ids.append(message['message_id'])
             self.store.update_draft(owner, draft['id'], ui_state=state, source_message_id=message['message_id'], source_chat_id=owner, source_message_ids=ids)
-            if message.get('text'):
+            if youtube:
                 state['youtube_pending'] = source
                 self.store.update_draft(owner, draft['id'], ui_state=state)
                 self._send(owner, tr(self._language(owner), 'dialog.youtube_mode'), [[self._button(owner, 'button.video', 'youtube', draft['id'], {'mode': 'video'}), self._button(owner, 'button.audio_only', 'youtube', draft['id'], {'mode': 'audio'})]])

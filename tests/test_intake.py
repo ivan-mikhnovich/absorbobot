@@ -322,7 +322,7 @@ class FakeSandbox:
 def env(tmp_path, monkeypatch):
     settings = Settings(admin_ids=(ADMIN,), state_dir=tmp_path / "state",
                         storage_dir=tmp_path / "mount" / "storage", backing_mount=tmp_path / "mount",
-                        min_free_bytes=1, quota_jobs=1)
+                        min_free_bytes=1, quota_jobs=1, bot_api_url="http://127.0.0.1:8081")
     monkeypatch.setattr(intake_module, "check_storage",
                         lambda value: {"mount": str(value.backing_mount), "writable": True,
                                        "free_bytes": 10 ** 18})
@@ -509,3 +509,118 @@ def test_cancelled_import_keeps_measured_preparation(env):
     assert [operation["operation"] for operation in operations] == ["copy", "analyze"]
     assert operations[1]["status"] == "cancelled" and operations[1]["reason"] == "interrupted"
     assert stored["status"] == "failed" and stored["failure_reason"] == "interrupted"
+
+
+def test_cloud_oversized_attachment_rejected_before_getfile(env):
+    from dataclasses import replace
+    store, intake, sandbox = env
+    intake.settings = replace(intake.settings, bot_api_url="https://api.telegram.org")
+    draft = store.create_draft(ALICE)
+    result = asyncio.run(intake.handle(payload(ALICE, draft["id"],
+                         document={"file_id": "large", "file_size": 20000001, "file_name": "lecture.mp4"})))
+    assert result["reason"] == "telegram_file_too_large"
+    assert intake.bot.calls == [] and sandbox.runs == []
+    assert store.files(draft["id"]) == []
+
+
+def test_cloud_download_enforces_actual_bytes_and_removes_partial_file(env):
+    from dataclasses import replace
+    from types import SimpleNamespace
+    store, intake, _ = env
+    intake.settings = replace(intake.settings, bot_api_url="https://api.telegram.org")
+    draft = store.create_draft(ALICE)
+    root = intake_module.create_work_tree(intake.settings, draft["id"])
+    target = root / "tmp" / "download.m4a"
+
+    async def stream(*args, **kwargs):
+        yield b"payload"
+        yield b"overflow"
+
+    intake.bot.session = SimpleNamespace(api=SimpleNamespace(file_url=lambda token, path: "https://api.telegram.org/file"),
+                                         stream_content=stream)
+    intake.bot.token = "fixture"
+    with pytest.raises(IntakeError) as error:
+        asyncio.run(intake._download_telegram("documents/file.m4a", target, root, 7))
+    assert error.value.code == "input_too_large"
+    assert not target.exists()
+
+
+def test_cloud_download_relative_path_imports_content(env):
+    from dataclasses import replace
+    from types import SimpleNamespace
+    store, intake, _ = env
+    intake.settings = replace(intake.settings, bot_api_url="https://api.telegram.org")
+    draft = store.create_draft(ALICE)
+
+    async def get_file(file_id):
+        return {"file_path": "documents/file.m4a", "file_size": 7}
+
+    async def stream(*args, **kwargs):
+        yield b"pay"
+        yield b"load"
+
+    intake.bot.get_file = get_file
+    intake.bot.session = SimpleNamespace(api=SimpleNamespace(file_url=lambda token, path: "https://api.telegram.org/file"),
+                                         stream_content=stream)
+    intake.bot.token = "fixture"
+    result = asyncio.run(intake.handle(payload(ALICE, draft["id"],
+                         document={"file_id": "small", "file_size": 7, "file_name": "lecture.m4a"})))
+    assert result["status"] == "imported"
+    file = store.files(draft["id"])[0]
+    assert file["sha256"] == hashlib.sha256(b"payload").hexdigest()
+    assert file["bytes"] == 7 and file["duration"] == 12.5
+    root = intake.settings.storage_dir / "jobs" / draft["id"]
+    assert (root / file["relative_path"]).read_bytes() == b"payload"
+    assert not list((root / "tmp").glob("*.m4a"))
+
+
+def test_oversized_cloud_material_preserves_already_imported_recording(env):
+    from dataclasses import replace
+    store, intake, _ = env
+    draft = store.create_draft(ALICE)
+    first = asyncio.run(intake.handle(payload(ALICE, draft["id"],
+                        document={"file_id": "media", "file_size": 7, "file_name": "recording.m4a"})))
+    assert first["status"] == "imported"
+    before = store.files(draft["id"])
+    intake.settings = replace(intake.settings, bot_api_url="https://api.telegram.org")
+    rejected = asyncio.run(intake.handle(payload(ALICE, draft["id"], message_id=102,
+                           document={"file_id": "slides", "file_size": 20000001, "file_name": "slides.pdf"})))
+    assert rejected["reason"] == "telegram_file_too_large"
+    assert store.files(draft["id"]) == before
+    assert store.get_draft(draft["id"])["status"] == "ready"
+    assert intake.bot.calls == ["media"]
+
+
+def test_cancelled_external_worker_partial_is_removed_without_worker_result(env):
+    store, intake, sandbox = env
+    draft = store.create_draft(ALICE)
+
+    async def scenario():
+        reached = asyncio.Event()
+        paths = []
+
+        async def run(work_uuid, phase, argv, **kwargs):
+            root = sandbox._root(work_uuid)
+            request = root / "tmp" / Path(argv[2]).name
+            data = json.loads(request.read_text())
+            partial = root / "tmp" / (data["download_id"] + ".m4a")
+            partial.write_bytes(b"unfinished")
+            neighbor = root / "tmp" / "unrelated.m4a"
+            neighbor.write_bytes(b"preserve")
+            paths.extend((request, partial, neighbor))
+            reached.set()
+            await asyncio.Event().wait()
+
+        sandbox.run = run
+        task = asyncio.create_task(intake.handle(payload(ALICE, draft["id"],
+                                   text="https://files.example.org/recording.m4a")))
+        await asyncio.wait_for(reached.wait(), 2)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert not paths[0].exists() and not paths[1].exists()
+        assert paths[2].read_bytes() == b"preserve"
+        assert store.files(draft["id"]) == []
+        assert store.get_draft(draft["id"])["status"] == "failed"
+
+    asyncio.run(scenario())

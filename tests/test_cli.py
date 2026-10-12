@@ -18,7 +18,7 @@ from absorbobot import cli, config
 def settings(tmp_path):
     core_config = tmp_path / "catalog.yaml"
     core_config.write_text("providers:\n  dynamic:\n    base_url: https://api.example/v1\n    api_key_env: DYNAMIC_CLOUD_KEY\n  optional:\n    base_url: https://optional.example/v1\n    api_key_env: OPTIONAL_CLOUD_KEY\n")
-    return config.Settings(storage_dir=tmp_path / "volume" / "new data", backing_mount=tmp_path / "volume", state_dir=tmp_path / "SSD state", absorbent_config=core_config, config_path=tmp_path / "new config.yaml", secrets_file=tmp_path / "protected.env", api_binary=tmp_path / "tools" / "telegram-bot-api")
+    return config.Settings(storage_dir=tmp_path / "volume" / "new data", backing_mount=tmp_path / "volume", state_dir=tmp_path / "SSD state", absorbent_config=core_config, config_path=tmp_path / "new config.yaml", secrets_file=tmp_path / "protected.env", api_binary=tmp_path / "tools" / "telegram-bot-api", bot_api_url="http://127.0.0.1:8081")
 
 
 def test_install_only_own_units_and_reload(settings, monkeypatch, tmp_path):
@@ -150,18 +150,20 @@ def test_missing_token_distinguished(settings):
         asyncio.run(cli.check_telegram(settings, {}))
 
 
-def test_generated_units_are_accepted_by_systemd_with_space_and_percent_paths(settings, tmp_path):
+@pytest.mark.parametrize("api_url", ["http://127.0.0.1:8081", "https://api.telegram.org"])
+def test_generated_units_are_accepted_by_systemd_with_space_and_percent_paths(settings, tmp_path, api_url):
     from dataclasses import replace
     analyzer = shutil.which("systemd-analyze")
     if analyzer is None:
         pytest.skip("systemd-analyze не установлен.")
     changed = replace(settings, state_dir=tmp_path / "SSD state%value",
                       secrets_file=tmp_path / "protected key.env",
-                      api_binary=Path("/usr/bin/true"))
-    for name, content in cli.render_units(changed, uv_binary="/usr/bin/true").items():
+                      api_binary=Path("/usr/bin/true"), bot_api_url=api_url)
+    units = cli.render_units(changed, uv_binary="/usr/bin/true")
+    for name, content in units.items():
         (tmp_path / name).write_text(content)
     result = subprocess.run(
-        [analyzer, "--user", "verify", str(tmp_path / "absorbobot.service"),
-         str(tmp_path / "absorbobot-api.service")], capture_output=True, text=True)
+        [analyzer, "--user", "verify", *(str(tmp_path / name) for name in units)],
+        capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
     assert result.stderr == ""
