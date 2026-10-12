@@ -92,6 +92,11 @@ _SHA = re.compile(r"[0-9a-f]{40}\Z")
 _REQUIRED_TOOLS = ("uv", "bwrap", "ffmpeg", "ffprobe", "pdfinfo", "pdftoppm", "soffice", "pandoc", "lualatex", "kpsewhich", "bun")
 
 
+def _positive_int(value: object) -> bool:
+    """Отличить положительное целое от bool и остальных типов."""
+    return type(value) is int and value > 0
+
+
 def _validate_api_url(value: str) -> None:
     if value == "https://api.telegram.org":
         return
@@ -368,7 +373,16 @@ def validate_probe(data: dict, tool_env: Path) -> dict:
                 raise ConfigError("Некорректная спецификация модели probe.")
             if spec["name"] != name or type(spec["default"]) is not bool or any(not isinstance(spec[key], str) for key in ("name", "provider", "backend", "whisper_model", "model", "api_model")):
                 raise ConfigError("Некорректные поля спецификации модели probe.")
-            if not isinstance(provider, dict) or set(provider) != {"name", "base_url", "api_key_env"} or any(not isinstance(v, str) for v in provider.values()) or type(model["local"]) is not bool:
+            # Новое ядро добавляет необязательный размер батча: None означает размер у провайдера.
+            if "batch_size" in spec and spec["batch_size"] is not None and not _positive_int(spec["batch_size"]):
+                raise ConfigError("Некорректная спецификация модели probe.")
+            # Провайдер принимает прежние три ключа и необязательный размер батча.
+            if (not isinstance(provider, dict) or not {"name", "base_url", "api_key_env"} <= set(provider)
+                    or set(provider) - {"name", "base_url", "api_key_env", "batch_size"}
+                    or any(key != "batch_size" and not isinstance(value, str) for key, value in provider.items())
+                    or type(model["local"]) is not bool):
+                raise ConfigError("Некорректный провайдер probe.")
+            if "batch_size" in provider and not _positive_int(provider["batch_size"]):
                 raise ConfigError("Некорректный провайдер probe.")
             if provider["api_key_env"] and (not _ENV_NAME.fullmatch(provider["api_key_env"]) or provider["api_key_env"] in {"ABSORBOBOT_TOKEN", "TELEGRAM_API_ID", "TELEGRAM_API_HASH"}):
                 raise ConfigError("Некорректное имя переменной ключа в probe.")

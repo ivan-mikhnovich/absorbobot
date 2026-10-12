@@ -30,6 +30,53 @@ def test_valid_probe_catalog_not_pinned(probe_data):
     assert set(probe_data["models"]["llm"]) == {"configured-llm"}
 
 
+def _model_entries(probe_data):
+    """Собрать все дескрипторы моделей снимка probe независимо от категории."""
+    return [entry for table in probe_data["models"].values() for entry in table.values()]
+
+
+@pytest.mark.parametrize("value", [1, 4])
+def test_probe_accepts_provider_batch_size(probe_data, value):
+    """Ядро 0.3.0 добавляет у провайдера необязательный положительный размер батча."""
+    for entry in _model_entries(probe_data):
+        entry["provider"]["batch_size"] = value
+    tool = Path(probe_data["runtime"]["tool_env"])
+    assert config.validate_probe(probe_data, tool) is probe_data
+
+
+@pytest.mark.parametrize("value", [1, None])
+def test_probe_accepts_spec_batch_size(probe_data, value):
+    """Спецификация модели допускает null и положительное целое."""
+    for entry in _model_entries(probe_data):
+        entry["spec"]["batch_size"] = value
+    tool = Path(probe_data["runtime"]["tool_env"])
+    assert config.validate_probe(probe_data, tool) is probe_data
+
+
+@pytest.mark.parametrize("value", [0, "4", True])
+def test_probe_rejects_invalid_provider_batch_size(probe_data, value):
+    for entry in _model_entries(probe_data):
+        entry["provider"]["batch_size"] = value
+    with pytest.raises(config.ConfigError, match="Некорректный провайдер probe."):
+        config.validate_probe(probe_data, Path(probe_data["runtime"]["tool_env"]))
+
+
+@pytest.mark.parametrize("value", [0, "4", True])
+def test_probe_rejects_invalid_spec_batch_size(probe_data, value):
+    for entry in _model_entries(probe_data):
+        entry["spec"]["batch_size"] = value
+    with pytest.raises(config.ConfigError, match="Некорректная спецификация модели probe."):
+        config.validate_probe(probe_data, Path(probe_data["runtime"]["tool_env"]))
+
+
+def test_probe_rejects_unknown_provider_key(probe_data):
+    """Прежний лишний ключ провайдера по-прежнему отвергается."""
+    _model_entries(probe_data)[0]["provider"]["api_key"] = "private"
+    with pytest.raises(config.ConfigError, match="Некорректный провайдер probe.") as caught:
+        config.validate_probe(probe_data, Path(probe_data["runtime"]["tool_env"]))
+    assert "private" not in str(caught.value)
+
+
 @pytest.mark.parametrize("field,value", [("commit", None), ("commit", "short"), ("dirty", True), ("dirty", None), ("version", "unknown")])
 def test_unknown_or_dirty_engine_rejected(probe_data, field, value):
     probe_data["version_info"][field] = value

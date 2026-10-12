@@ -51,6 +51,7 @@
   "stage.select_keyframes": "Selecting frames",
   "stage.prepare_slides": "Preparing materials",
   "stage.stt": "Transcribing speech",
+  "stage.summarize": "Summarising the transcript",
   "stage.describe_keyframes": "Describing frames",
   "stage.describe_slides": "Describing materials",
   "stage.synthesize": "Synthesizing notes",

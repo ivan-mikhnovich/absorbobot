@@ -51,6 +51,7 @@
   "stage.select_keyframes": "Отбор кадров",
   "stage.prepare_slides": "Подготовка материалов",
   "stage.stt": "Распознавание речи",
+  "stage.summarize": "Выжимка транскрипта",
   "stage.describe_keyframes": "Описание кадров",
   "stage.describe_slides": "Описание материалов",
   "stage.synthesize": "Синтез конспекта",
