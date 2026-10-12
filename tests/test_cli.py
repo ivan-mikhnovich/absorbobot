@@ -145,6 +145,16 @@ def test_getme_only_and_safe_token_errors(settings, monkeypatch, mode):
     assert set(events) <= {"getMe", "close"}
 
 
+def test_generated_units_limit_restart_storm(settings):
+    units = cli.render_units(settings, uv_binary="/usr/bin/true")
+    assert set(units) == {"absorbobot.service", "absorbobot-api.service"}
+    for name, unit in units.items():
+        assert "\nStartLimitIntervalSec=60\n" in unit, name
+        assert "\nStartLimitBurst=10\n" in unit, name
+        assert "\nRestartSec=5s\n" in unit, name
+        assert "\nRestart=on-failure\n" in unit, name
+
+
 def test_missing_token_distinguished(settings):
     with pytest.raises(config.ConfigError, match="Не задана переменная ABSORBOBOT_TOKEN"):
         asyncio.run(cli.check_telegram(settings, {}))

@@ -59,6 +59,12 @@ def _exec(argv: list[str | Path]) -> str:
     return " ".join(_quoted(value, exec_arg=True) for value in argv)
 
 
+# Ограничение частоты перезапусков: сбойный запуск не должен превращаться
+# в цикл и вычерпывать лимиты Telegram на публикацию описаний команд.
+_START_LIMITS = "StartLimitIntervalSec=60\nStartLimitBurst=10\n"
+_SERVICE_TAIL = "UMask=0077\nKillMode=control-group\nTimeoutStopSec=15s\nRestart=on-failure\nRestartSec=5s\n"
+
+
 def render_units(settings: Settings, *, uv_binary: str | Path | None = None) -> dict[str, str]:
     """Сформировать units по фактическим путям без запуска или установки."""
     uv = uv_binary or shutil.which("uv")
@@ -68,11 +74,11 @@ def render_units(settings: Settings, *, uv_binary: str | Path | None = None) -> 
     if settings.bot_api_url == "https://api.telegram.org":
         bot = _exec([uv, "tool", "run", "--offline", "--no-config", "absorbobot", "serve", "--config", settings.config_path])
         return {"absorbobot.service": (
-            "[Unit]\nDescription=Absorbobot\n\n[Service]\nType=simple\n"
+            f"[Unit]\nDescription=Absorbobot\n{_START_LIMITS}\n[Service]\nType=simple\n"
             f"WorkingDirectory={str(settings.state_dir).replace('%', '%%')}\n"
             f"EnvironmentFile={str(settings.secrets_file).replace('%', '%%')}\n"
             f"ExecStartPre={pre}\nExecStart={bot}\n"
-            "UMask=0077\nKillMode=control-group\nTimeoutStopSec=15s\nRestart=on-failure\n"
+            f"{_SERVICE_TAIL}"
             "\n[Install]\nWantedBy=default.target\n"
         )}
     # Каталог моделей динамический; native API не должен получать bot/cloud ключи.
@@ -105,16 +111,16 @@ def render_units(settings: Settings, *, uv_binary: str | Path | None = None) -> 
     common = (
         f"EnvironmentFile={secrets_path}\n"
         f"ExecStartPre={pre}\n"
-        "UMask=0077\nKillMode=control-group\nTimeoutStopSec=15s\nRestart=on-failure\n"
+        f"{_SERVICE_TAIL}"
     )
     return {
         "absorbobot-api.service": (
-            "[Unit]\nDescription=Absorbobot local Telegram Bot API\n\n[Service]\nType=simple\n"
+            f"[Unit]\nDescription=Absorbobot local Telegram Bot API\n{_START_LIMITS}\n[Service]\nType=simple\n"
             f"WorkingDirectory={api_workdir}\n{common}"
             f"UnsetEnvironment={' '.join(sorted(unset))}\nExecStart={native}\n\n[Install]\nWantedBy=default.target\n"
         ),
         "absorbobot.service": (
-            "[Unit]\nDescription=Absorbobot\nRequires=absorbobot-api.service\nAfter=absorbobot-api.service\n\n"
+            f"[Unit]\nDescription=Absorbobot\nRequires=absorbobot-api.service\nAfter=absorbobot-api.service\n{_START_LIMITS}\n"
             f"[Service]\nType=simple\nWorkingDirectory={bot_workdir}\n{common}"
             f"ExecStart={bot}\n\n[Install]\nWantedBy=default.target\n"
         ),
