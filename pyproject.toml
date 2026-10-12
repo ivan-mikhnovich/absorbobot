@@ -1,6 +1,6 @@
 [project]
 name = "absorbobot"
-version = "0.3.0"
+version = "0.3.1"
 description = "Telegram interface to Absorbent lecture notes."
 readme = "README.md"
 license = "GPL-3.0-or-later"
