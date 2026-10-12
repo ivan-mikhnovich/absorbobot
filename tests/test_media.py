@@ -1,4 +1,4 @@
-"""Границы разбора ссылок, метаданных и фактического потока загрузки YouTube."""
+"""Границы разбора ссылок площадок, метаданных и фактического потока загрузки."""
 
 from __future__ import annotations
 
@@ -6,12 +6,16 @@ import os
 
 import pytest
 
-from absorbobot.workers.youtube import (
+from absorbobot.workers.media import (
     DownloadBudget,
-    YouTubeError,
+    MediaError,
     clean_title,
     download,
-    normalize_youtube_url,
+    normalize_media_url,
+    placeholder_name,
+    placeholder_platform,
+    platform_label,
+    resolve_media_url,
     tree_bytes,
     validate_metadata,
 )
@@ -19,6 +23,14 @@ from absorbobot.workers.youtube import (
 
 CANONICAL = "https://www.youtube.com/watch?v=abcdefghijk"
 VIDEO = "abcdefghijk"
+
+
+def platform_of(url: str):
+    """Правила площадки, которой принадлежит канонический URL."""
+    return resolve_media_url(url)[0]
+
+
+YOUTUBE = platform_of(CANONICAL)
 
 
 def metadata(**fields):
@@ -39,7 +51,7 @@ def metadata(**fields):
     "https://www.youtube.com/embed/abcdefghijk",
 ])
 def test_normalize_accepts_only_canonical_https_video_forms(value):
-    assert normalize_youtube_url(value) == CANONICAL
+    assert normalize_media_url(value) == CANONICAL
 
 
 @pytest.mark.parametrize("value", [
@@ -70,26 +82,42 @@ def test_normalize_accepts_only_canonical_https_video_forms(value):
     "https://www.youtube.com/%77atch?v=abcdefghijk",
 ])
 def test_normalize_rejects_userinfo_ports_playlists_and_fake_hosts(value):
-    with pytest.raises(YouTubeError) as error:
-        normalize_youtube_url(value)
-    assert str(error.value) == "invalid_youtube_url"
+    with pytest.raises(MediaError) as error:
+        normalize_media_url(value)
+    assert str(error.value) == "invalid_media_url"
+
+
+def test_resolve_reports_platform_canonical_url_and_identity():
+    platform, url, media_id = resolve_media_url("https://youtu.be/abcdefghijk")
+    assert platform.name == "youtube"
+    assert (url, media_id) == (CANONICAL, VIDEO)
+
+
+def test_placeholder_names_carry_platform_and_stay_recognizable():
+    assert placeholder_name("https://youtu.be/abcdefghijk") == "YouTube abcdefghijk"
+    assert placeholder_platform("YouTube abcdefghijk") == "youtube"
+    assert placeholder_platform("Lecture one") is None
+    assert placeholder_platform("YouTube") is None
+    assert platform_label("youtube") == "work.youtube"
+    assert platform_label(None) == "work.lecture"
 
 
 def test_validate_metadata_accepts_known_finite_not_live_video():
     # Метаданные yt-dlp дают числовую длительность, а не строку.
-    assert validate_metadata(metadata(duration=100), VIDEO, 14400) == {"duration": 100}
-    assert validate_metadata(metadata(duration=14400.0, live_status="was_live"), VIDEO, 14400) == {"duration": 14400.0}
+    assert validate_metadata(metadata(duration=100), VIDEO, 14400, YOUTUBE) == {"duration": 100}
+    assert validate_metadata(metadata(duration=14400.0, live_status="was_live"), VIDEO, 14400,
+                             YOUTUBE) == {"duration": 14400.0}
 
 
 @pytest.mark.parametrize("fields,code", [
-    ({"live_status": "is_live"}, "youtube_live"),
-    ({"live_status": "is_upcoming"}, "youtube_live"),
-    ({"live_status": "post_live"}, "youtube_live"),
-    ({"is_live": True}, "youtube_live"),
-    ({"is_upcoming": True}, "youtube_live"),
-    ({"live_status": None}, "youtube_live"),
-    ({"availability": "private"}, "youtube_unavailable"),
-    ({"availability": "premium_only"}, "youtube_unavailable"),
+    ({"live_status": "is_live"}, "media_live"),
+    ({"live_status": "is_upcoming"}, "media_live"),
+    ({"live_status": "post_live"}, "media_live"),
+    ({"is_live": True}, "media_live"),
+    ({"is_upcoming": True}, "media_live"),
+    ({"live_status": None}, "media_live"),
+    ({"availability": "private"}, "media_unavailable"),
+    ({"availability": "premium_only"}, "media_unavailable"),
     ({"duration": None}, "invalid_duration"),
     ({"duration": 0}, "invalid_duration"),
     ({"duration": -5}, "invalid_duration"),
@@ -98,14 +126,15 @@ def test_validate_metadata_accepts_known_finite_not_live_video():
     ({"duration": float("inf")}, "invalid_duration"),
     ({"duration": True}, "invalid_duration"),
     ({"duration": 14401}, "media_too_long"),
-    ({"id": "zzzzzzzzzzz"}, "invalid_youtube_metadata"),
-    ({"_type": "playlist"}, "invalid_youtube_metadata"),
-    ({"extractor_key": "Generic"}, "invalid_youtube_metadata"),
-    ({"entries": [{}]}, "invalid_youtube_metadata"),
+    ({"id": "zzzzzzzzzzz"}, "invalid_media_metadata"),
+    ({"_type": "playlist"}, "invalid_media_metadata"),
+    ({"extractor_key": "VK"}, "invalid_media_metadata"),
+    ({"extractor_key": "Generic"}, "invalid_media_metadata"),
+    ({"entries": [{}]}, "invalid_media_metadata"),
 ])
 def test_validate_metadata_rejects_live_private_and_unknown(fields, code):
-    with pytest.raises(YouTubeError) as error:
-        validate_metadata(metadata(**fields), VIDEO, 14400)
+    with pytest.raises(MediaError) as error:
+        validate_metadata(metadata(**fields), VIDEO, 14400, YOUTUBE)
     assert str(error.value) == code
 
 
@@ -116,7 +145,7 @@ def test_download_budget_stops_stream_without_content_length(tmp_path):
     inside.write_bytes(b"x" * 100)
     budget = DownloadBudget(directory, 1000)
     budget({"filename": str(inside), "downloaded_bytes": 100})
-    with pytest.raises(YouTubeError) as error:
+    with pytest.raises(MediaError) as error:
         budget({"filename": str(inside), "downloaded_bytes": 1001})
     assert str(error.value) == "input_too_large"
 
@@ -126,7 +155,7 @@ def test_download_budget_checks_real_tree_growth(tmp_path):
     directory.mkdir()
     (directory / "media.f137.mp4").write_bytes(b"x" * 3000)
     budget = DownloadBudget(directory, 1000)
-    with pytest.raises(YouTubeError) as error:
+    with pytest.raises(MediaError) as error:
         budget({"downloaded_bytes": 10})
     assert str(error.value) == "input_too_large"
 
@@ -137,7 +166,7 @@ def test_download_budget_rejects_progress_outside_tmp(tmp_path):
     outside = tmp_path / "escape.mp4"
     outside.write_bytes(b"x")
     budget = DownloadBudget(directory, 1000)
-    with pytest.raises(YouTubeError) as error:
+    with pytest.raises(MediaError) as error:
         budget({"filename": str(outside), "downloaded_bytes": 1})
     assert str(error.value) == "unsafe_file_path"
 
@@ -150,25 +179,29 @@ def test_tree_bytes_counts_files_and_rejects_specials(tmp_path):
     assert tree_bytes(root) == 7
 
     os.mkfifo(root / "pipe")
-    with pytest.raises(YouTubeError) as error:
+    with pytest.raises(MediaError) as error:
         tree_bytes(root)
     assert str(error.value) == "unsafe_file_path"
 
 
-def test_download_refuses_unknown_video_id_and_mode_before_filesystem():
-    with pytest.raises(YouTubeError) as error:
-        download("short", "video", 10, 10, 10, 10)
-    assert str(error.value) == "invalid_youtube_url"
-    with pytest.raises(YouTubeError) as error:
-        download(VIDEO, "both", 10, 10, 10, 10)
-    assert str(error.value) == "invalid_youtube_url"
+@pytest.mark.parametrize("url", ["short", "https://youtu.be/abcdefghij"])
+def test_download_refuses_unknown_url_before_filesystem(url):
+    with pytest.raises(MediaError) as error:
+        download(url, "video", 10, 10, 10, 10)
+    assert str(error.value) == "invalid_media_url"
+
+
+def test_download_refuses_unknown_mode_before_filesystem():
+    with pytest.raises(MediaError) as error:
+        download(CANONICAL, "both", 10, 10, 10, 10)
+    assert str(error.value) == "invalid_media_url"
 
 
 def test_validate_metadata_reports_actual_title_but_omits_absent_one():
     # Заголовок приходит только из фактических метаданных, не из идентификатора.
-    assert validate_metadata(metadata(duration=100, title="Lecture 1"), VIDEO, 14400) == {
+    assert validate_metadata(metadata(duration=100, title="Lecture 1"), VIDEO, 14400, YOUTUBE) == {
         "duration": 100, "title": "Lecture 1"}
-    assert validate_metadata(metadata(duration=100), VIDEO, 14400) == {"duration": 100}
+    assert validate_metadata(metadata(duration=100), VIDEO, 14400, YOUTUBE) == {"duration": 100}
 
 
 def test_clean_title_strips_controls_trims_and_bounds():
@@ -183,15 +216,15 @@ def test_split_video_stream_progress_never_uses_one_stream_total(tmp_path):
     from absorbobot.workers.progress import ProgressWriter, read_progress
 
     root = tmp_path / "work"
-    directory = root / "tmp" / "youtube"
+    directory = root / "tmp" / "media"
     directory.mkdir(parents=True)
     video, audio = directory / "video.mp4", directory / "audio.m4a"
     video.write_bytes(b"x" * 60)
     audio.write_bytes(b"x" * 10)
-    writer = ProgressWriter(root, "youtube", "bytes", min_interval=0)
+    writer = ProgressWriter(root, "media", "bytes", min_interval=0)
     budget = DownloadBudget(directory, 1000, report=writer.update)
     budget({"filename": str(video), "downloaded_bytes": 60, "total_bytes": 60})
     budget({"filename": str(audio), "downloaded_bytes": 10, "total_bytes": 20})
-    current = read_progress(root, "youtube", "bytes")
+    current = read_progress(root, "media", "bytes")
     assert current["completed"] == 70
     assert current["total"] is None

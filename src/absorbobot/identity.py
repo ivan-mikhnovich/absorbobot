@@ -1,11 +1,11 @@
 """Человекочитаемые названия лекций без внутренних идентификаторов."""
 
-import re
 import unicodedata
 from datetime import datetime
 from pathlib import PurePath
 
 from .i18n import tr
+from .workers.media import placeholder_platform, platform_label
 
 
 def readable_text(value: str, limit: int = 160) -> str:
@@ -31,13 +31,12 @@ def work_title(store, work: dict, *, viewer: int | None = None) -> str:
         return title
     files = store.files(work["id"])
     media = next((file for file in files if file["role"] == "media" and not file["removed"]), None)
-    if media:
-        title = readable_text(PurePath(media["original_name"]).stem)
-        if title and not re.fullmatch(r"YouTube [A-Za-z0-9_-]{11}", title):
-            return title
-    source = (state.get("source") or {}).get("text", "")
-    is_youtube = "youtu" in source or bool(media and re.fullmatch(r"YouTube [A-Za-z0-9_-]{11}", title))
-    label = tr(language, "work.youtube" if is_youtube else "work.lecture")
+    title = readable_text(PurePath(media["original_name"]).stem) if media else ""
+    platform = placeholder_platform(title)
+    if title and platform is None:
+        # Имя файла записи — фактический заголовок, он и есть название лекции.
+        return title
+    label = tr(language, platform_label(platform))
     timestamp = work.get("created_at") or work.get("accepted_at")
     if timestamp:
         try:

@@ -12,7 +12,7 @@ from pathlib import PurePath
 from .i18n import tr
 from .identity import work_title, work_preview
 from .store import StoreError, QuotaError
-from .workers.youtube import YouTubeError, normalize_youtube_url
+from .workers.media import MediaError, normalize_media_url
 from .workers.external import normalize_external_url
 
 
@@ -20,7 +20,7 @@ COMMANDS = ('start', 'new', 'jobs', 'settings', 'language', 'help', 'cancel', 's
 NUMBERS = ('fps', 'hash_threshold', 'min_scene_seconds', 'slides_dpi')
 CATEGORIES = ('stt', 'vision', 'llm')
 UNFINISHED = ['queued', 'preparing', 'running', 'awaiting_reuse_choice', 'cancel_requested']
-ACTIONS = {'nav', 'lang', 'new_confirm', 'files_added', 'advanced', 'choose', 'set', 'number', 'reset', 'summary', 'submit', 'reuse', 'force_new', 'late_reuse', 'late_force', 'history', 'redeliver', 'cancel_confirm', 'youtube', 'materials'}
+ACTIONS = {'nav', 'lang', 'new_confirm', 'files_added', 'advanced', 'choose', 'set', 'number', 'reset', 'summary', 'submit', 'reuse', 'force_new', 'late_reuse', 'late_force', 'history', 'redeliver', 'cancel_confirm', 'media', 'materials'}
 
 
 def now_utc():
@@ -90,9 +90,9 @@ class Dialog:
         user = self.store.get_user(owner)
         chosen = self._defaults()
         explicit = draft['settings'] if draft else user['settings']
-        chosen.update({key: value for key, value in explicit.items() if key in (*NUMBERS, *CATEGORIES, 'language', 'youtube_mode')})
+        chosen.update({key: value for key, value in explicit.items() if key in (*NUMBERS, *CATEGORIES, 'language', 'media_mode')})
         chosen.setdefault('language', 'auto')
-        chosen.setdefault('youtube_mode', 'video')
+        chosen.setdefault('media_mode', 'video')
         override = explicit.get('output_language_override', user.get('output_language_override'))
         chosen['output_language'] = override or user['language']
         return chosen
@@ -202,12 +202,12 @@ class Dialog:
         if draft['close_requested']:
             self._send(owner, tr(self._language(owner), 'dialog.preparing'))
             return
-        youtube, external = False, False
+        media, external = False, False
         if message.get('text'):
             try:
-                normalize_youtube_url(message['text'])
-                youtube = True
-            except YouTubeError:
+                normalize_media_url(message['text'])
+                media = True
+            except MediaError:
                 try:
                     normalize_external_url(message['text'])
                     external = True
@@ -216,7 +216,7 @@ class Dialog:
         state = dict(draft['ui_state'])
         source = self._source(message)
         pending = state.get('pending_import_ids', [])
-        has_source = bool(state.get('youtube_pending') or (state.get('source') or {}).get('message_id') in pending or any(f['role'] == 'media' and not f['removed'] for f in self.store.files(draft['id'])))
+        has_source = bool(state.get('media_pending') or (state.get('source') or {}).get('message_id') in pending or any(f['role'] == 'media' and not f['removed'] for f in self.store.files(draft['id'])))
         document = message.get('document') or {}
         extension = PurePath(document.get('file_name', '')).suffix.lower()
         material_exts = {str(ext).lower() if str(ext).startswith('.') else '.' + str(ext).lower() for ext in self.core['material_extensions']}
@@ -232,10 +232,10 @@ class Dialog:
             ids = list(draft['source_message_ids'])
             ids.append(message['message_id'])
             self.store.update_draft(owner, draft['id'], ui_state=state, source_message_id=message['message_id'], source_chat_id=owner, source_message_ids=ids)
-            if youtube:
-                state['youtube_pending'] = source
+            if media:
+                state['media_pending'] = source
                 self.store.update_draft(owner, draft['id'], ui_state=state)
-                self._send(owner, tr(self._language(owner), 'dialog.youtube_mode'), [[self._button(owner, 'button.video', 'youtube', draft['id'], {'mode': 'video'}), self._button(owner, 'button.audio_only', 'youtube', draft['id'], {'mode': 'audio'})]])
+                self._send(owner, tr(self._language(owner), 'dialog.media_mode'), [[self._button(owner, 'button.video', 'media', draft['id'], {'mode': 'video'}), self._button(owner, 'button.audio_only', 'media', draft['id'], {'mode': 'audio'})]])
                 return
         else:
             ids = list(draft['source_message_ids'])
@@ -317,7 +317,7 @@ class Dialog:
         if len([f for f in files if f['role'] == 'media']) != 1:
             raise StoreError('draft_incomplete')
         # Даже устаревшая кнопка не может обойти ожидающий импорт материала.
-        if draft['ui_state'].get('pending_import_ids') or draft['ui_state'].get('youtube_pending'):
+        if draft['ui_state'].get('pending_import_ids') or draft['ui_state'].get('media_pending'):
             raise StoreError('draft_incomplete')
         chosen = self._chosen(owner, draft)
         self._validate(chosen)
@@ -337,8 +337,8 @@ class Dialog:
         lines = [tr(lang, 'dialog.summary', id=work_title(self.store, draft))]
         for file in files:
             lines.append(tr(lang, 'dialog.file', name=file['original_name'], bytes=file['bytes'], duration=file['duration'] if file['duration'] is not None else tr(lang, 'unknown'), pages=file['pages'] if file['pages'] is not None else tr(lang, 'unknown')))
-        for key in ('language', 'output_language', *NUMBERS, 'youtube_mode'):
-            value = tr(lang, 'value.' + chosen[key]) if key in ('language', 'output_language', 'youtube_mode') else chosen[key]
+        for key in ('language', 'output_language', *NUMBERS, 'media_mode'):
+            value = tr(lang, 'value.' + chosen[key]) if key in ('language', 'output_language', 'media_mode') else chosen[key]
             lines.append(f'{tr(lang, "setting." + key)}: {value}')
         for category, model in models.items():
             provider = model['provider']
@@ -356,7 +356,7 @@ class Dialog:
                 raise StoreError('invalid_number')
             if key == 'fps' and value <= 0 or key == 'min_scene_seconds' and value < 0:
                 raise StoreError('invalid_number')
-        if chosen.get('language') not in ('auto', 'ru', 'en') or chosen.get('output_language') not in ('ru', 'en') or chosen.get('youtube_mode') not in ('video', 'audio'):
+        if chosen.get('language') not in ('auto', 'ru', 'en') or chosen.get('output_language') not in ('ru', 'en') or chosen.get('media_mode') not in ('video', 'audio'):
             raise StoreError('invalid_number')
 
     def _accepted(self, owner, job):
@@ -617,8 +617,8 @@ class Dialog:
                 state = dict(draft['ui_state'])
                 state.pop('number', None)
                 selected = {'output_language_override': None}
-                if 'youtube_mode' in draft['settings']:
-                    selected['youtube_mode'] = draft['settings']['youtube_mode']
+                if 'media_mode' in draft['settings']:
+                    selected['media_mode'] = draft['settings']['media_mode']
                 self.store.update_draft(owner, target, settings=selected, ui_state=state)
             self._main_settings(owner, self.store.get_draft(target, owner) if draft else None)
         elif action == 'materials':
@@ -630,17 +630,17 @@ class Dialog:
                 fields['status'] = 'collecting'
             self.store.update_draft(owner, target, **fields)
             self._send(owner, tr(self._language(owner), 'dialog.add_materials'), [[self._button(owner, 'button.files_added', 'files_added', target)]])
-        elif action == 'youtube':
+        elif action == 'media':
             draft = self._target(owner, target)
-            source = draft['ui_state'].get('youtube_pending')
+            source = draft['ui_state'].get('media_pending')
             if not source:
                 raise StoreError('choice_consumed')
             mode = payload['mode']
-            self._persist(owner, draft, 'youtube_mode', mode)
+            self._persist(owner, draft, 'media_mode', mode)
             state = dict(draft['ui_state'])
-            state.pop('youtube_pending', None)
+            state.pop('media_pending', None)
             self.store.update_draft(owner, target, ui_state=state)
-            self._intake(owner, target, {**source, 'youtube_mode': mode})
+            self._intake(owner, target, {**source, 'media_mode': mode})
         elif action == 'summary':
             self._files_added(owner, target)
         elif action in ('submit', 'reuse', 'force_new'):

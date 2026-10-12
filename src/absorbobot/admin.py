@@ -280,7 +280,7 @@ class Admin:
         text = [self._t(actor, "job_detail", id=work_title(self.store, job, viewer=actor), owner=job["owner_id"], status=self._status(actor, job["status"]), accepted=job["accepted_at"], initial=job["initial_accepted_at"], version=self._value(actor, job["engine_version"]), commit=self._value(actor, job["engine_commit"]), counted=self._t(actor, "yes" if job["quota_counted"] else "no"), deleted=self._t(actor, "yes" if job["files_deleted"] else "no"))]
         for category, model in job["models"].items():
             text.append(self._t(actor, "model_row", category=category, name=model.get("name", self._t(actor, "unknown")), provider=(model.get("provider") or {}).get("name", self._t(actor, "unknown")), location=self._t(actor, "local" if model.get("local") else "cloud")))
-        for field in ("language", "output_language", "fps", "hash_threshold", "min_scene_seconds", "slides_dpi", "youtube_mode"):
+        for field in ("language", "output_language", "fps", "hash_threshold", "min_scene_seconds", "slides_dpi", "media_mode"):
             if field in job["settings"]:
                 text.append(self._t(actor, "parameter", label=self._t(actor, "parameter_" + field), value=job["settings"][field]))
         for field in ("cpu_user_seconds", "cpu_system_seconds", "busy_gpu_seconds"):

@@ -21,7 +21,7 @@ from .config import ConfigError, check_storage, create_work_tree
 from .i18n import tr
 from .metrics import aggregate_reports
 from .store import StoreError, utc_now
-from .workers.youtube import YouTubeError, normalize_youtube_url, tree_bytes
+from .workers.media import MediaError, normalize_media_url, placeholder_name, tree_bytes
 from .workers.external import normalize_external_url
 from .workers.progress import ProgressWriter, read_progress, discard_progress
 
@@ -45,7 +45,7 @@ def input_signature(files: list[dict], settings: dict, models: dict) -> str:
         raise ValueError("Invalid content digest.")
     parameters = {key: settings[key] for key in (
         "language", "output_language", "fps", "hash_threshold",
-        "min_scene_seconds", "slides_dpi", "youtube_mode",
+        "min_scene_seconds", "slides_dpi", "media_mode",
     ) if key in settings}
     for key in ("fps", "min_scene_seconds"):
         if key in parameters:
@@ -61,7 +61,7 @@ def input_signature(files: list[dict], settings: dict, models: dict) -> str:
             if type(value) is not int or (not 0 <= value <= 64 if key == "hash_threshold" else value <= 0):
                 raise ValueError("Invalid processing parameter.")
     for key, allowed in (("language", ("auto", "ru", "en")),
-                         ("output_language", ("ru", "en")), ("youtube_mode", ("video", "audio"))):
+                         ("output_language", ("ru", "en")), ("media_mode", ("video", "audio"))):
         if key in parameters and parameters[key] not in allowed:
             raise ValueError("Invalid processing parameter.")
     selected = {}
@@ -332,8 +332,8 @@ _ERROR_CODES = frozenset({
     "unsupported_input", "invalid_file_metadata", "input_too_large", "work_limit",
     "storage_unavailable", "unsafe_file_path", "invalid_duration", "media_too_long",
     "missing_audio", "invalid_material", "material_pages_exceeded", "analysis_failed",
-    "invalid_youtube_url", "invalid_youtube_metadata", "youtube_live", "youtube_unavailable",
-    "youtube_failed", "telegram_file_unavailable", "media_exists", "source_first",
+    "invalid_media_url", "invalid_media_metadata", "media_live", "media_unavailable",
+    "media_failed", "telegram_file_unavailable", "media_exists", "source_first",
     "invalid_url", "unsafe_url", "download_failed", "telegram_file_too_large",
     "cancelled", "timeout", "sandbox_unavailable", "handshake_failed", "invalid_runtime",
     "interrupted",
@@ -373,8 +373,8 @@ class Intake:
                 return
             state = dict(draft["ui_state"])
             state["pending_import_ids"] = [value for value in state.get("pending_import_ids", []) if value != message_id]
-            if (state.get("youtube_pending") or {}).get("message_id") == message_id:
-                state.pop("youtube_pending", None)
+            if (state.get("media_pending") or {}).get("message_id") == message_id:
+                state.pop("media_pending", None)
             self.store.db.execute("UPDATE drafts SET ui_state=? WHERE id=? AND owner_id=?",
                                   (json.dumps(state, ensure_ascii=False, allow_nan=False), work_uuid, owner))
 
@@ -603,19 +603,18 @@ class Intake:
                 raise
             raise IntakeError("timeout" if isinstance(exc, TimeoutError) else "telegram_file_unavailable") from None
 
-    async def lookup_youtube_metadata(self, owner: int, work_uuid: str, url: str) -> dict:
+    async def lookup_media_metadata(self, owner: int, work_uuid: str, url: str) -> dict:
         """Прочитать метаданные уже загруженной записи без повторной загрузки.
 
         Вспомогательный режим восстановления: он не трогает файлы задания, а
         только переносит фактический заголовок в состояние черновика.
         """
-        canonical = normalize_youtube_url(url)
-        video_id = canonical.rsplit("=", 1)[1]
+        canonical = normalize_media_url(url)
         runtime = {"tool_env": sys.prefix, "python_executable": sys.executable,
                    "python_base_prefix": sys.base_prefix}
         result = await self.sandbox.run(
-            work_uuid, "youtube", [runtime["python_executable"], "/workers/youtube.py",
-            "--metadata", video_id, str(self.settings.max_media_seconds)],
+            work_uuid, "media", [runtime["python_executable"], "/workers/media.py",
+            "--metadata", canonical, str(self.settings.max_media_seconds)],
             runtime=runtime, env={}, network=True, selected_key_names=(),
             timeout=min(600, self.settings.max_processing_seconds))
         data = _worker_result(result)
@@ -630,7 +629,7 @@ class Intake:
         message_id = message.get("message_id")
         if type(message_id) is not int or message_id <= 0:
             raise IntakeError("invalid_file_metadata")
-        completed, preparing, youtube, external = True, False, False, False
+        completed, preparing, media, external = True, False, False, False
         display_title, preview = None, None
         root = None
         cleanup: list[Path] = []
@@ -646,20 +645,20 @@ class Intake:
                 return {"status": "imported", "file_id": existing["id"], "duplicate": True}
             if message.get("text"):
                 try:
-                    url = normalize_youtube_url(message["text"])
-                    youtube = True
-                except YouTubeError:
+                    url = normalize_media_url(message["text"])
+                    media = True
+                except MediaError:
                     url = normalize_external_url(message["text"])
                     external = True
-            if youtube:
-                mode = message.get("youtube_mode", payload.get("youtube_mode", draft["settings"].get("youtube_mode", "video")))
+            if media:
+                mode = message.get("media_mode", payload.get("media_mode", draft["settings"].get("media_mode", "video")))
                 if mode not in ("video", "audio"):
-                    raise IntakeError("invalid_youtube_url")
+                    raise IntakeError("invalid_media_url")
                 extension = ".mkv" if mode == "video" else ".m4a"
                 if extension not in _extensions(self.core["media_extensions"]):
                     raise IntakeError("unsupported_input")
                 descriptor = {"role": "media", "bytes": 0, "extension": extension,
-                              "original_name": "YouTube " + url.rsplit("=", 1)[1] + extension}
+                              "original_name": placeholder_name(url) + extension}
             elif external:
                 descriptor = None
             else:
@@ -675,18 +674,18 @@ class Intake:
             preparing = True
             self._notice(owner, work_uuid, message_id, "intake.preparing")
             self._draft(owner, work_uuid)
-            if youtube:
+            if media:
                 runtime = {"tool_env": sys.prefix, "python_executable": sys.executable,
                            "python_base_prefix": sys.base_prefix}
-                async with self._operation(owner, work_uuid, "youtube") as outcome:
-                    async with self._track(owner, work_uuid, root, "youtube", "bytes") as track:
+                async with self._operation(owner, work_uuid, "media") as outcome:
+                    async with self._track(owner, work_uuid, root, "media", "bytes") as track:
                         result = await self.sandbox.run(
-                            work_uuid, "youtube", [runtime["python_executable"], "/workers/youtube.py",
-                            url.rsplit("=", 1)[1], mode, str(limit), str(self.settings.max_media_seconds),
+                            work_uuid, "media", [runtime["python_executable"], "/workers/media.py",
+                            url, mode, str(limit), str(self.settings.max_media_seconds),
                             str(self.settings.max_work_bytes), str(self.settings.min_free_bytes)],
                             runtime=runtime, env={}, network=True, selected_key_names=(),
                             timeout=self.settings.max_processing_seconds)
-                        outcome["resources"] = _phase_resources(result.get("resource_report"), "input_youtube")
+                        outcome["resources"] = _phase_resources(result.get("resource_report"), "input_media")
                         data = _worker_result(result)
                         relative = Path(data["relative_path"])
                         if relative.is_absolute() or ".." in relative.parts or not relative.parts or relative.parts[0] != "tmp":
@@ -694,7 +693,7 @@ class Intake:
                         source, source_root = root / relative, root / "tmp"
                         title = data.get("title")
                         if isinstance(title, str) and title:
-                            # Показываем фактический заголовок, а не идентификатор видео.
+                            # Показываем фактический заголовок, а не идентификатор записи.
                             descriptor["original_name"] = title + extension
                             display_title = title
                         track["final"] = _stat_size(source)
@@ -809,7 +808,7 @@ class Intake:
             # Заголовок и предпросмотр — человекочитаемая идентичность, не UUID хранения.
             state = dict(draft["ui_state"])
             if descriptor["role"] == "media":
-                if display_title is None and not youtube:
+                if display_title is None and not media:
                     display_title = PurePath(descriptor["original_name"]).stem or None
                 if display_title:
                     state["title"] = display_title
@@ -826,10 +825,10 @@ class Intake:
                 fields = {"status": "ready", "failure_reason": None, "ui_state": state}
                 if descriptor["role"] == "media":
                     fields.update(source_message_id=message_id, source_chat_id=owner)
-                if youtube:
-                    # Режим YouTube меняет подпись входа; сбрасываем её явно, чтобы
+                if media:
+                    # Режим подготовки меняет подпись входа; сбрасываем её явно, чтобы
                     # update_draft не подменил подтверждённый статус ready на collecting.
-                    fields["settings"] = {**draft["settings"], "youtube_mode": mode}
+                    fields["settings"] = {**draft["settings"], "media_mode": mode}
                     fields["input_signature"] = None
                     fields["snapshot"] = {}
                 self.store.update_draft(owner, work_uuid, **fields)
@@ -845,13 +844,13 @@ class Intake:
                 raise
             return {"status": "skipped", "reason": exc.code}
         except Exception as exc:
-            code = getattr(exc, "code", str(exc) if isinstance(exc, YouTubeError) else None)
+            code = getattr(exc, "code", str(exc) if isinstance(exc, MediaError) else None)
             if isinstance(exc, ConfigError):
                 code = "storage_unavailable"
             if code not in _ERROR_CODES:
                 code = "analysis_failed" if preparing else "telegram_file_unavailable"
             self._finish_failure(owner, work_uuid, code, preparing,
-                                 terminal=youtube or code in ("cancelled", "interrupted"))
+                                 terminal=media or code in ("cancelled", "interrupted"))
             self._notice(owner, work_uuid, message_id, "intake.error." + code)
             return {"status": "rejected", "reason": code, "work_uuid": work_uuid}
         finally:
@@ -860,7 +859,7 @@ class Intake:
                     temporary.unlink(missing_ok=True)
             if root is not None:
                 # Progress-файлы — внутренний транспорт; в дереве задания не остаются.
-                for stage in ("youtube", "external", "telegram", "copy", "analyze"):
+                for stage in ("media", "external", "telegram", "copy", "analyze"):
                     discard_progress(root, stage)
             if completed:
                 self._clear_pending(owner, work_uuid, message_id)

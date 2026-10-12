@@ -1,7 +1,14 @@
-"""Скачать ровно одно YouTube-видео без пользовательской конфигурации."""
+"""Скачать ровно одну запись поддерживаемой площадки без пользовательской конфигурации.
+
+Поддержаны YouTube и VK Video. Ссылку разбирает собственный строгий парсер
+площадки, а в yt-dlp регистрируются только экстракторы этой площадки, поэтому
+произвольные URL и чужие экстракторы процессу недоступны.
+"""
 
 from __future__ import annotations
 
+from collections.abc import Callable
+import importlib
 import json
 import math
 import os
@@ -11,18 +18,20 @@ import stat
 import subprocess
 import sys
 import time
+from typing import NamedTuple
 from urllib.parse import parse_qsl, urlsplit
 from uuid import uuid4
 
 
-class YouTubeError(ValueError):
+class MediaError(ValueError):
     """Отказ с безопасным кодом без URL потоков и ответов сервера."""
 
 
 VIDEO_ID = re.compile(r"[A-Za-z0-9_-]{11}")
+_VIDEO_HEIGHT = 1080
 
 
-def normalize_youtube_url(value: str) -> str:
+def _parse_youtube(value: str) -> tuple[str, str]:
     """Разобрать только разрешённые HTTPS-формы и построить собственный URL."""
     try:
         if not isinstance(value, str) or any(c.isspace() or ord(c) < 32 for c in value):
@@ -57,9 +66,82 @@ def normalize_youtube_url(value: str) -> str:
             raise ValueError
         if not VIDEO_ID.fullmatch(video_id):
             raise ValueError
-        return "https://www.youtube.com/watch?v=" + video_id
+        return "https://www.youtube.com/watch?v=" + video_id, video_id
     except (ValueError, TypeError, AttributeError):
-        raise YouTubeError("invalid_youtube_url") from None
+        raise MediaError("invalid_media_url") from None
+
+
+def _check_youtube(info: dict) -> None:
+    """Не начинать загрузку эфира, премьеры или закрытой записи."""
+    if (info.get("is_live") or info.get("is_upcoming")
+            or info.get("live_status") not in ("not_live", "was_live")):
+        raise MediaError("media_live")
+    if info.get("availability") not in (None, "public", "unlisted"):
+        raise MediaError("media_unavailable")
+
+
+class Platform(NamedTuple):
+    """Правила площадки: что принимать, чем скачивать и что проверять в метаданных."""
+
+    name: str
+    # Ключи экстрактора yt-dlp, метаданным которых доверяет проверка.
+    keys: frozenset[str]
+    # Полные имена классов yt-dlp, подключаемых к загрузчику.
+    extractors: tuple[str, ...]
+    # Режим подготовки и селектор формата yt-dlp для него.
+    formats: dict[str, str]
+    parse: Callable[[str], tuple[str, str]]
+    check: Callable[[dict], None]
+
+
+# Порядок площадок задаёт порядок разбора: узлы у них не пересекаются.
+_PLATFORMS = (
+    Platform(name="youtube", keys=frozenset({"Youtube"}),
+             extractors=("yt_dlp.extractor.youtube.YoutubeIE",),
+             formats={"video": f"bv[height<={_VIDEO_HEIGHT}]+ba/b[height<={_VIDEO_HEIGHT}]",
+                      "audio": "bestaudio"},
+             parse=_parse_youtube, check=_check_youtube),
+)
+
+# Служебная подпись площадки в имени записи и ключ её названия в интерфейсе.
+LABELS: dict[str, tuple[str, str]] = {
+    "youtube": ("YouTube", "work.youtube"),
+}
+
+
+def resolve_media_url(value: str) -> tuple[Platform, str, str]:
+    """Найти площадку по ссылке и вернуть её правила, канонический URL и идентификатор."""
+    for platform in _PLATFORMS:
+        try:
+            url, media_id = platform.parse(value)
+        except MediaError:
+            continue
+        return platform, url, media_id
+    raise MediaError("invalid_media_url")
+
+
+def normalize_media_url(value: str) -> str:
+    """Проверить ссылку без сети и вернуть канонический URL одной записи."""
+    return resolve_media_url(value)[1]
+
+
+def placeholder_name(value: str) -> str:
+    """Построить служебное имя записи до получения фактического заголовка."""
+    platform, _, media_id = resolve_media_url(value)
+    return LABELS[platform.name][0] + " " + media_id
+
+
+def placeholder_platform(name: str) -> str | None:
+    """Назвать площадку по служебному имени записи или вернуть ``None``."""
+    for platform, (label, _) in LABELS.items():
+        if name.startswith(label + " "):
+            return platform
+    return None
+
+
+def platform_label(platform: str | None) -> str:
+    """Ключ названия площадки для интерфейса, обычной лекции — по умолчанию."""
+    return LABELS[platform][1] if platform in LABELS else "work.lecture"
 
 
 _TITLE_LIMIT = 300
@@ -75,26 +157,22 @@ def clean_title(value) -> str | None:
     return title[:_TITLE_LIMIT]
 
 
-def validate_metadata(info: dict, video_id: str, max_seconds: float) -> dict:
+def validate_metadata(info: dict, media_id: str, max_seconds: float, platform: Platform) -> dict:
     """Не начинать загрузку эфира, плейлиста или записи неизвестной длины."""
     if (not isinstance(info, dict) or info.get("_type", "video") != "video"
-            or info.get("id") != video_id or info.get("entries") is not None
-            or info.get("extractor_key") not in (None, "Youtube")):
-        raise YouTubeError("invalid_youtube_metadata")
-    if (info.get("is_live") or info.get("is_upcoming")
-            or info.get("live_status") not in ("not_live", "was_live")):
-        raise YouTubeError("youtube_live")
-    if info.get("availability") not in (None, "public", "unlisted"):
-        raise YouTubeError("youtube_unavailable")
+            or info.get("id") != media_id or info.get("entries") is not None
+            or info.get("extractor_key") not in platform.keys):
+        raise MediaError("invalid_media_metadata")
+    platform.check(info)
     duration = info.get("duration")
     if type(duration) not in (int, float) or not math.isfinite(duration) or duration <= 0:
-        raise YouTubeError("invalid_duration")
+        raise MediaError("invalid_duration")
     if duration > max_seconds:
-        raise YouTubeError("media_too_long")
+        raise MediaError("media_too_long")
     result = {"duration": duration}
     title = clean_title(info.get("title"))
     if title is not None:
-        # Заголовок берём из фактических метаданных, а не из идентификатора видео.
+        # Заголовок берём из фактических метаданных, а не из идентификатора записи.
         result["title"] = title
     return result
 
@@ -117,7 +195,7 @@ def tree_bytes(root: Path) -> int:
                 elif stat.S_ISREG(info.st_mode):
                     total += info.st_size
                 else:
-                    raise YouTubeError("unsafe_file_path")
+                    raise MediaError("unsafe_file_path")
     return total
 
 
@@ -134,7 +212,7 @@ class DownloadBudget:
         if filename:
             path = Path(filename).resolve()
             if not path.is_relative_to(self.directory):
-                raise YouTubeError("unsafe_file_path")
+                raise MediaError("unsafe_file_path")
             value = progress.get("downloaded_bytes")
             if type(value) is int and value >= 0:
                 self.downloaded[str(path)] = max(self.downloaded.get(str(path), 0), value)
@@ -142,7 +220,7 @@ class DownloadBudget:
             # Форматы видео и аудио приходят отдельно; их общий размер заранее неизвестен.
             self.report(sum(self.downloaded.values()), None)
         if sum(self.downloaded.values()) > self.limit or tree_bytes(self.directory) > 2 * self.limit:
-            raise YouTubeError("input_too_large")
+            raise MediaError("input_too_large")
 
 
 class _QuietLogger:
@@ -166,75 +244,67 @@ def _progress_module():
     return module
 
 
-def _download(video_id: str, mode: str, byte_limit: int, max_seconds: float,
-              directory: Path) -> dict:
+def _downloader(platform: Platform, options: dict):
+    """Открыть yt-dlp с экстракторами только выбранной площадки."""
     from yt_dlp import YoutubeDL
     from yt_dlp.globals import all_plugins_loaded, plugin_dirs
     # Library API не читает CLI config; глобальная загрузка plugins отключена явно.
     plugin_dirs.value = []
     all_plugins_loaded.value = True
-    from yt_dlp.extractor.youtube import YoutubeIE
-
-    reporter = _progress_module().ProgressWriter(directory.parent.parent, "youtube", "bytes",
-                                                 min_interval=0.5)
-    budget = DownloadBudget(directory, byte_limit, report=reporter.update)
-    options = {
-        "quiet": True, "no_warnings": True, "logger": _QuietLogger(),
-        "noplaylist": True, "cachedir": False, "cookiefile": None,
-        "cookiesfrombrowser": None, "enable_file_urls": False,
-        "js_runtimes": {"bun": {"path": "/usr/bin/bun"}}, "remote_components": [],
-        "outtmpl": str(directory / "media.%(ext)s"), "restrictfilenames": True,
-        "paths": {"home": str(directory), "temp": str(directory)},
-        "progress_hooks": [budget], "max_filesize": byte_limit,
-        "concurrent_fragment_downloads": 1, "socket_timeout": 30,
-        "retries": 3, "fragment_retries": 3, "overwrites": False,
-        "format": "bv[height<=1080]+ba/b[height<=1080]" if mode == "video" else "bestaudio",
-        "merge_output_format": "mkv",
-        "postprocessors": ([{"key": "FFmpegVideoRemuxer", "preferedformat": "mkv"}]
-                           if mode == "video" else
-                           [{"key": "FFmpegExtractAudio", "preferredcodec": "m4a"}]),
-    }
-    with YoutubeDL(options, auto_init=False) as downloader:
-        downloader.add_info_extractor(YoutubeIE())
-        info = downloader.extract_info("https://www.youtube.com/watch?v=" + video_id,
-                                       download=False, process=False)
-        metadata = validate_metadata(info, video_id, max_seconds)
-        # Обработка только уже проверенного результата YoutubeIE, без повторного arbitrary URL.
-        result = downloader.process_ie_result(info, download=True)
-        if mode == "video" and (type(result.get("height")) not in (int, float)
-                                 or not 0 < result["height"] <= 1080):
-            raise YouTubeError("invalid_youtube_metadata")
-    output = directory / ("media.mkv" if mode == "video" else "media.m4a")
-    if output.is_symlink() or not output.is_file() or output.stat().st_size <= 0:
-        raise YouTubeError("youtube_failed")
-    if output.stat().st_size > byte_limit:
-        raise YouTubeError("input_too_large")
-    budget({})
-    return {"relative_path": str(output.relative_to(directory.parent.parent)), **metadata}
-
-
-def lookup(video_id: str, max_seconds: float) -> dict:
-    """Прочитать метаданные записи без загрузки файла для восстановления подписи."""
-    if not VIDEO_ID.fullmatch(video_id):
-        raise YouTubeError("invalid_youtube_url")
-    from yt_dlp import YoutubeDL
-    from yt_dlp.globals import all_plugins_loaded, plugin_dirs
-    plugin_dirs.value = []
-    all_plugins_loaded.value = True
-    from yt_dlp.extractor.youtube import YoutubeIE
-
-    options = {
+    parameters = {
         "quiet": True, "no_warnings": True, "logger": _QuietLogger(),
         "noplaylist": True, "cachedir": False, "cookiefile": None,
         "cookiesfrombrowser": None, "enable_file_urls": False,
         "js_runtimes": {"bun": {"path": "/usr/bin/bun"}}, "remote_components": [],
         "socket_timeout": 30, "retries": 3,
+        **options,
     }
-    with YoutubeDL(options, auto_init=False) as downloader:
-        downloader.add_info_extractor(YoutubeIE())
-        info = downloader.extract_info("https://www.youtube.com/watch?v=" + video_id,
-                                       download=False, process=False)
-        return validate_metadata(info, video_id, max_seconds)
+    downloader = YoutubeDL(parameters, auto_init=False)
+    for dotted in platform.extractors:
+        module, _, name = dotted.rpartition(".")
+        downloader.add_info_extractor(getattr(importlib.import_module(module), name)())
+    return downloader
+
+
+def _download(platform: Platform, url: str, media_id: str, mode: str, byte_limit: int,
+              max_seconds: float, directory: Path) -> dict:
+    reporter = _progress_module().ProgressWriter(directory.parent.parent, "media", "bytes",
+                                                 min_interval=0.5)
+    budget = DownloadBudget(directory, byte_limit, report=reporter.update)
+    options = {
+        "outtmpl": str(directory / "media.%(ext)s"), "restrictfilenames": True,
+        "paths": {"home": str(directory), "temp": str(directory)},
+        "progress_hooks": [budget], "max_filesize": byte_limit,
+        "concurrent_fragment_downloads": 1, "fragment_retries": 3, "overwrites": False,
+        "format": platform.formats[mode],
+        "merge_output_format": "mkv",
+        "postprocessors": ([{"key": "FFmpegVideoRemuxer", "preferedformat": "mkv"}]
+                           if mode == "video" else
+                           [{"key": "FFmpegExtractAudio", "preferredcodec": "m4a"}]),
+    }
+    with _downloader(platform, options) as downloader:
+        info = downloader.extract_info(url, download=False, process=False)
+        metadata = validate_metadata(info, media_id, max_seconds, platform)
+        # Обработка только уже проверенного результата площадки, без повторного arbitrary URL.
+        result = downloader.process_ie_result(info, download=True)
+        if mode == "video" and (type(result.get("height")) not in (int, float)
+                                 or not 0 < result["height"] <= _VIDEO_HEIGHT):
+            raise MediaError("invalid_media_metadata")
+    output = directory / ("media.mkv" if mode == "video" else "media.m4a")
+    if output.is_symlink() or not output.is_file() or output.stat().st_size <= 0:
+        raise MediaError("media_failed")
+    if output.stat().st_size > byte_limit:
+        raise MediaError("input_too_large")
+    budget({})
+    return {"relative_path": str(output.relative_to(directory.parent.parent)), **metadata}
+
+
+def lookup(url: str, max_seconds: float) -> dict:
+    """Прочитать метаданные записи без загрузки файла для восстановления подписи."""
+    platform, canonical, media_id = resolve_media_url(url)
+    with _downloader(platform, {}) as downloader:
+        info = downloader.extract_info(canonical, download=False, process=False)
+        return validate_metadata(info, media_id, max_seconds, platform)
 
 
 def _stop_child(process: subprocess.Popen) -> None:
@@ -266,15 +336,16 @@ def _stop_child(process: subprocess.Popen) -> None:
     psutil.wait_procs(alive, timeout=10)
 
 
-def download(video_id: str, mode: str, byte_limit: int, max_seconds: float,
+def download(url: str, mode: str, byte_limit: int, max_seconds: float,
              max_work_bytes: int, min_free_bytes: int, *, work_root: Path = Path("/work")) -> dict:
-    if not VIDEO_ID.fullmatch(video_id) or mode not in ("video", "audio"):
-        raise YouTubeError("invalid_youtube_url")
+    resolve_media_url(url)
+    if mode not in ("video", "audio"):
+        raise MediaError("invalid_media_url")
     root = work_root.resolve(strict=True)
-    directory = root / "tmp" / ("youtube-" + uuid4().hex)
+    directory = root / "tmp" / ("media-" + uuid4().hex)
     directory.mkdir(mode=0o700)
     result_path = directory / "result.json"
-    command = [sys.executable, str(Path(__file__).absolute()), "--child", video_id,
+    command = [sys.executable, str(Path(__file__).absolute()), "--child", url,
                mode, str(byte_limit), str(max_seconds), str(directory)]
     with (directory / "downloader.stdout.log").open("xb") as stdout, (directory / "downloader.stderr.log").open("xb") as stderr:
         process = subprocess.Popen(command, stdin=subprocess.DEVNULL,
@@ -282,27 +353,27 @@ def download(video_id: str, mode: str, byte_limit: int, max_seconds: float,
     try:
         while True:
             if tree_bytes(directory) > 2 * byte_limit:
-                raise YouTubeError("input_too_large")
+                raise MediaError("input_too_large")
             if tree_bytes(root) > max_work_bytes:
-                raise YouTubeError("work_limit")
+                raise MediaError("work_limit")
             usage = os.statvfs(root)
             if usage.f_bavail * usage.f_frsize < min_free_bytes:
-                raise YouTubeError("storage_unavailable")
+                raise MediaError("storage_unavailable")
             if process.poll() is not None:
                 break
             time.sleep(0.1)
         if not result_path.is_file() or result_path.stat().st_size > 16384:
-            raise YouTubeError("youtube_failed")
+            raise MediaError("media_failed")
         result = json.loads(result_path.read_text(encoding="utf-8"))
         if process.returncode or not result.get("ok"):
-            raise YouTubeError(result.get("error", "youtube_failed"))
+            raise MediaError(result.get("error", "media_failed"))
         output = (root / result["relative_path"]).resolve(strict=True)
         if not output.is_relative_to(directory) or output.stat().st_size > byte_limit:
-            raise YouTubeError("input_too_large")
+            raise MediaError("input_too_large")
         return result
     except BaseException:
         # Неудачная загрузка не оставляет progress-файл стадии в дереве задания.
-        _progress_module().discard_progress(root, "youtube")
+        _progress_module().discard_progress(root, "media")
         raise
     finally:
         # Не оставлять дочернюю extraction/merge после отказа guard или сигнала.
@@ -310,7 +381,7 @@ def download(video_id: str, mode: str, byte_limit: int, max_seconds: float,
 
 
 def _result_error(exc: Exception) -> dict:
-    code = str(exc) if isinstance(exc, YouTubeError) else "youtube_failed"
+    code = str(exc) if isinstance(exc, MediaError) else "media_failed"
     return {"ok": False, "error": code}
 
 
@@ -319,7 +390,7 @@ def main(argv: list[str] | None = None) -> int:
     if args and args[0] == "--metadata":
         try:
             if len(args) != 3:
-                raise YouTubeError("youtube_failed")
+                raise MediaError("media_failed")
             result = {"ok": True, **lookup(args[1], float(args[2]))}
         except Exception as exc:
             result = _result_error(exc)
@@ -329,8 +400,10 @@ def main(argv: list[str] | None = None) -> int:
         directory = Path(args[-1])
         try:
             if len(args) != 6:
-                raise YouTubeError("youtube_failed")
-            result = {"ok": True, **_download(args[1], args[2], int(args[3]), float(args[4]), directory)}
+                raise MediaError("media_failed")
+            platform, canonical, media_id = resolve_media_url(args[1])
+            result = {"ok": True, **_download(platform, canonical, media_id, args[2],
+                                              int(args[3]), float(args[4]), directory)}
         except Exception as exc:
             detail = re.sub(r"(?<=://)[^\s/]+@", "<redacted>@", str(exc))
             print(f"{type(exc).__name__}: {detail}", file=sys.stderr)
@@ -341,7 +414,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0 if result["ok"] else 2
     try:
         if len(args) != 6:
-            raise YouTubeError("youtube_failed")
+            raise MediaError("media_failed")
         result = download(args[0], args[1], int(args[2]), float(args[3]), int(args[4]), int(args[5]))
         print(json.dumps(result, allow_nan=False))
         return 0

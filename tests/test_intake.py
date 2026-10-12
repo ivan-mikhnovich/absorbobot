@@ -33,7 +33,7 @@ DOC_ONE = "b" * 64
 DOC_TWO = "c" * 64
 
 SETTINGS = {"language": "ru", "output_language": "ru", "fps": 1.0, "hash_threshold": 8,
-            "min_scene_seconds": 2.0, "slides_dpi": 150, "youtube_mode": "video"}
+            "min_scene_seconds": 2.0, "slides_dpi": 150, "media_mode": "video"}
 MODELS = {
     "llm": {"name": "big", "spec": {"backend": "openai", "api_model": "deepseek-v4-flash",
                                     "whisper_model": None},
@@ -79,7 +79,7 @@ def test_signature_ignores_removed_material_but_not_its_order_or_type():
     {"hash_threshold": 9},
     {"min_scene_seconds": 3.0},
     {"slides_dpi": 200},
-    {"youtube_mode": "audio"},
+    {"media_mode": "audio"},
 ])
 def test_signature_changes_with_processing_parameters(change):
     files = [entry("media", MEDIA, "input/a.m4a"), entry("material", DOC_ONE, "input/s.pdf")]
@@ -109,7 +109,7 @@ def test_signature_changes_with_effective_model_endpoint(mutate):
     ([entry("media", MEDIA, "input/a.m4a")], {**SETTINGS, "hash_threshold": 65}),
     ([entry("media", MEDIA, "input/a.m4a")], {**SETTINGS, "slides_dpi": 0}),
     ([entry("media", MEDIA, "input/a.m4a")], {**SETTINGS, "language": "de"}),
-    ([entry("media", MEDIA, "input/a.m4a")], {**SETTINGS, "youtube_mode": "both"}),
+    ([entry("media", MEDIA, "input/a.m4a")], {**SETTINGS, "media_mode": "both"}),
 ])
 def test_signature_rejects_invalid_content_and_parameters(files, settings):
     with pytest.raises(ValueError):
@@ -296,9 +296,9 @@ class FakeSandbox:
             self.reached.set()
             await self.gate.wait()
         root = self._root(work_uuid)
-        if phase == "youtube":
-            extension = ".mkv" if argv[2] == "video" else ".m4a"
-            media = root / "tmp" / "youtube-fake" / ("media" + extension)
+        if phase == "media":
+            extension = ".mkv" if argv[3] == "video" else ".m4a"
+            media = root / "tmp" / "media-fake" / ("media" + extension)
             media.parent.mkdir(parents=True, exist_ok=True)
             media.write_bytes(b"downloaded")
             value = {"ok": True, "relative_path": str(media.relative_to(root)), "duration": 30.0}
@@ -403,25 +403,31 @@ def test_handle_propagates_paused_and_keeps_pending(env):
     assert store.files(draft["id"]) == []
 
 
-def test_handle_youtube_import_keeps_ready_and_records_mode(env):
+@pytest.mark.parametrize("link,mode,canonical,name", [
+    ("https://youtu.be/abcdefghijk", "audio", "https://www.youtube.com/watch?v=abcdefghijk",
+     "YouTube abcdefghijk.m4a"),
+])
+def test_handle_media_import_keeps_ready_and_records_mode(env, link, mode, canonical, name):
     store, intake, sandbox = env
     draft = store.create_draft(ALICE)
     store.update_draft(ALICE, draft["id"], ui_state={
         "pending_import_ids": [MESSAGE_ID],
-        "youtube_pending": {"message_id": MESSAGE_ID, "chat": {"id": ALICE}}})
-    result = asyncio.run(intake.handle(payload(ALICE, draft["id"], text="https://youtu.be/abcdefghijk",
-                                               youtube_mode="audio")))
+        "media_pending": {"message_id": MESSAGE_ID, "chat": {"id": ALICE}}})
+    result = asyncio.run(intake.handle(payload(ALICE, draft["id"], text=link, media_mode=mode)))
     assert result["status"] == "imported"
     stored = store.get_draft(draft["id"])
     assert stored["status"] == "ready"
-    assert stored["settings"]["youtube_mode"] == "audio"
+    assert stored["settings"]["media_mode"] == mode
     files = store.files(draft["id"])
-    assert files[0]["original_name"] == "YouTube abcdefghijk.m4a"
+    assert files[0]["original_name"] == name
     assert stored["ui_state"]["pending_import_ids"] == []
-    assert "youtube_pending" not in stored["ui_state"]
-    assert [run["phase"] for run in sandbox.runs] == ["youtube", "analyze"]
+    assert "media_pending" not in stored["ui_state"]
+    assert [run["phase"] for run in sandbox.runs] == ["media", "analyze"]
     assert sandbox.runs[0]["network"] is True
     assert sandbox.runs[0]["selected_key_names"] == ()
+    # Worker получает канонический URL площадки, а не текст сообщения.
+    assert sandbox.runs[0]["argv"][2] == canonical
+    assert sandbox.runs[0]["argv"][3] == mode
 
 
 def test_later_material_import_survives_private_sandbox_runtime_links(env):
@@ -627,16 +633,16 @@ def test_cancelled_external_worker_partial_is_removed_without_worker_result(env)
     asyncio.run(scenario())
 
 
-def _youtube_then_analyze(sandbox, *, youtube_value, analyze_value):
+def _media_then_analyze(sandbox, *, media_value, analyze_value):
     """Собрать подмену sandbox: фаза загрузки и фаза разбора из одного словаря."""
 
     async def run(work_uuid, phase, argv, **kwargs):
         root = sandbox._root(work_uuid)
-        if phase == "youtube":
-            media = root / "tmp" / "youtube-fake" / "media.mkv"
+        if phase == "media":
+            media = root / "tmp" / "media-fake" / "media.mkv"
             media.parent.mkdir(parents=True, exist_ok=True)
             media.write_bytes(b"downloaded")
-            value = {"relative_path": str(media.relative_to(root)), **youtube_value}
+            value = {"relative_path": str(media.relative_to(root)), **media_value}
         else:
             value = dict(analyze_value)
             preview = value.get("preview_relative_path")
@@ -653,7 +659,7 @@ def _youtube_then_analyze(sandbox, *, youtube_value, analyze_value):
     sandbox.run = run
 
 
-def test_youtube_progress_and_title_reach_draft_during_await(env):
+def test_media_progress_and_title_reach_draft_during_await(env):
     store, intake, sandbox = env
     draft = store.create_draft(ALICE)
     store.update_draft(ALICE, draft["id"], ui_state={"pending_import_ids": [MESSAGE_ID]})
@@ -663,14 +669,14 @@ def test_youtube_progress_and_title_reach_draft_during_await(env):
 
         async def run(work_uuid, phase, argv, **kwargs):
             root = sandbox._root(work_uuid)
-            if phase == "youtube":
-                progress_module.write_progress(root, "youtube", completed=1234, total=4096, unit="bytes")
+            if phase == "media":
+                progress_module.write_progress(root, "media", completed=1234, total=4096, unit="bytes")
                 reached.set()
                 await gate.wait()
-                media = root / "tmp" / "youtube-fake" / "media.mkv"
+                media = root / "tmp" / "media-fake" / "media.mkv"
                 media.parent.mkdir(parents=True, exist_ok=True)
                 media.write_bytes(b"downloaded")
-                value = {"relative_path": "tmp/youtube-fake/media.mkv", "duration": 30.0,
+                value = {"relative_path": "tmp/media-fake/media.mkv", "duration": 30.0,
                          "title": "Lecture One"}
             else:
                 value = {"duration": 30.0, "pages": None}
@@ -690,7 +696,7 @@ def test_youtube_progress_and_title_reach_draft_during_await(env):
             if observed and observed.get("completed") == 1234:
                 break
             await asyncio.sleep(0.05)
-        assert observed["stage"] == "youtube" and observed["unit"] == "bytes"
+        assert observed["stage"] == "media" and observed["unit"] == "bytes"
         assert observed["completed"] == 1234 and observed["total"] == 4096
         gate.set()
         return await task
@@ -702,7 +708,7 @@ def test_youtube_progress_and_title_reach_draft_during_await(env):
     assert state["title"] == "Lecture One"
     assert store.files(draft["id"])[0]["original_name"] == "Lecture One.mkv"
     assert state["import_progress"]["stage"] == "analyze"
-    assert not (store.settings.storage_dir / "jobs" / draft["id"] / "tmp" / "progress.youtube.json").exists()
+    assert not (store.settings.storage_dir / "jobs" / draft["id"] / "tmp" / "progress.media.json").exists()
 
 
 def test_cancelled_import_leaves_no_success_progress(env):
@@ -714,7 +720,7 @@ def test_cancelled_import_leaves_no_success_progress(env):
         reached = asyncio.Event()
 
         async def run(work_uuid, phase, argv, **kwargs):
-            progress_module.write_progress(sandbox._root(work_uuid), "youtube",
+            progress_module.write_progress(sandbox._root(work_uuid), "media",
                                            completed=10, total=100, unit="bytes")
             reached.set()
             await asyncio.Event().wait()
@@ -736,9 +742,9 @@ def test_cancelled_import_leaves_no_success_progress(env):
 def test_analyze_preview_path_is_stored_for_accepted_media(env):
     store, intake, sandbox = env
     draft = store.create_draft(ALICE)
-    _youtube_then_analyze(
+    _media_then_analyze(
         sandbox,
-        youtube_value={"duration": 30.0, "title": "Резервная копия"},
+        media_value={"duration": 30.0, "title": "Резервная копия"},
         analyze_value={"duration": 30.0, "pages": None,
                        "preview_relative_path": "tmp/analyze-x/preview.jpg",
                        "preview_width": 320, "preview_height": 240})
@@ -753,9 +759,9 @@ def test_analyze_preview_path_is_stored_for_accepted_media(env):
 def test_preview_path_outside_tmp_is_ignored(env, preview):
     store, intake, sandbox = env
     draft = store.create_draft(ALICE)
-    _youtube_then_analyze(
+    _media_then_analyze(
         sandbox,
-        youtube_value={"duration": 30.0, "title": "T"},
+        media_value={"duration": 30.0, "title": "T"},
         analyze_value={"duration": 30.0, "pages": None,
                        "preview_relative_path": preview,
                        "preview_width": 320, "preview_height": 240})
@@ -764,7 +770,7 @@ def test_preview_path_outside_tmp_is_ignored(env, preview):
     assert "preview_relative_path" not in store.get_draft(draft["id"])["ui_state"]
 
 
-def test_lookup_youtube_metadata_stores_title_without_download(env):
+def test_lookup_media_metadata_stores_title_without_download(env):
     store, intake, sandbox = env
     draft = store.create_draft(ALICE)
     calls = []
@@ -779,10 +785,13 @@ def test_lookup_youtube_metadata_stores_title_without_download(env):
                 "resource_report": dict(FAKE_REPORT), "binding": {}}
 
     sandbox.run = run
-    result = asyncio.run(intake.lookup_youtube_metadata(ALICE, draft["id"], "https://youtu.be/abcdefghijk"))
+    result = asyncio.run(intake.lookup_media_metadata(ALICE, draft["id"], "https://youtu.be/abcdefghijk"))
     assert result == {"duration": 42.0, "title": "Recovered"}
     assert store.get_draft(draft["id"])["ui_state"]["title"] == "Recovered"
+    assert calls[0][0] == "media"
     assert calls[0][1][2] == "--metadata"
+    # Вспомогательная фаза получает канонический URL площадки.
+    assert calls[0][1][3] == "https://www.youtube.com/watch?v=abcdefghijk"
     assert store.files(draft["id"]) == []
 
 

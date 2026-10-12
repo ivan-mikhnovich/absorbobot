@@ -300,14 +300,14 @@ def test_second_source_and_pending_material_cannot_be_confirmed(dialog, store):
     assert not store.jobs(ALICE)
 
 
-def test_youtube_preparation_waits_for_explicit_mode_and_keeps_minimal_source(dialog, store):
+def test_media_preparation_waits_for_explicit_mode_and_keeps_minimal_source(dialog, store):
     dialog.handle_message(message(text='/new'))
     draft = store.active_draft(ALICE)
     dialog.handle_message(message(text='https://youtu.be/abcdefghijk', caption='private caption', forward_origin={'sender_user': {'id': BOB}}))
     assert not outbox(store, 'intake')
-    click(dialog, store, 'youtube', target=draft['id'], payload={'mode': 'audio'})
+    click(dialog, store, 'media', target=draft['id'], payload={'mode': 'audio'})
     payload = outbox(store, 'intake')[-1]['payload']
-    assert payload['message']['youtube_mode'] == 'audio'
+    assert payload['message']['media_mode'] == 'audio'
     assert 'caption' not in payload['message']
     assert 'forward_origin' not in payload['message']
     assert payload['message']['chat']['id'] == ALICE
@@ -413,7 +413,7 @@ def test_files_added_during_import_survives_restart_and_requires_confirmation(di
     dialog.handle_message(message(text='/new'))
     dialog.handle_message(message(text='https://youtu.be/abcdefghijk'))
     draft = store.active_draft(ALICE)
-    click(dialog, store, 'youtube', target=draft['id'], payload={'mode': 'video'})
+    click(dialog, store, 'media', target=draft['id'], payload={'mode': 'video'})
     token = tokens(store, 'files_added')[-1]
     store.update_draft(ALICE, draft['id'], status='preparing')
 
