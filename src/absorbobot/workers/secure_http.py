@@ -137,6 +137,23 @@ def _validate_url(value: str) -> str:
     return value
 
 
+def _validate_proxy(value: object) -> str:
+    """Проверить адрес прокси загрузок: http(s), узел, порт, без credentials."""
+    valid = False
+    if isinstance(value, str) and value and value.strip() == value \
+            and not any(c in value for c in ("\n", "\r", "\t", "\x00")):
+        try:
+            parsed = urlsplit(value)
+            valid = (parsed.scheme in ("http", "https") and parsed.hostname is not None
+                     and parsed.port is not None and parsed.username is None and parsed.password is None
+                     and parsed.path in ("", "/") and not parsed.query and not parsed.fragment)
+        except ValueError:
+            valid = False
+    if not valid:
+        raise FetchError("invalid_url")
+    return value
+
+
 class PinnedResolver(AbstractResolver):
     """DNS-резолвер, отдающий коннектору только проверенные адреса.
 
@@ -146,8 +163,11 @@ class PinnedResolver(AbstractResolver):
     ответов, как и любой непубличный адрес, отклоняет весь набор.
     """
 
-    def __init__(self, *, timeout: float = _CONNECT_TIMEOUT):
+    def __init__(self, *, timeout: float = _CONNECT_TIMEOUT,
+                 allow_private_hosts: frozenset[str] = frozenset()):
         self._timeout = timeout
+        # Узлы, разрешённые явной настройкой: сам прокси может быть локальным.
+        self._allow_private_hosts = allow_private_hosts
 
     async def resolve(self, host: str, port: int = 0,
                       family: socket.AddressFamily = socket.AF_UNSPEC) -> list[ResolveResult]:
@@ -166,7 +186,7 @@ class PinnedResolver(AbstractResolver):
         for afamily, _, proto, _, address in infos:
             literal = address[0]
             parsed = _parse_ip(literal)
-            if parsed is None or not _ip_is_public(parsed):
+            if parsed is None or (not _ip_is_public(parsed) and host not in self._allow_private_hosts):
                 raise FetchError("unsafe_url") from None
             key = (literal, afamily)
             if key in seen:
@@ -190,13 +210,20 @@ class SecureClient:
 
     :param timeout: общий срок одной операции :meth:`open` вместе со всеми
         перенаправлениями и чтением тела.
+    :param proxy: необязательный адрес прокси ``http(s)://host:port``; без него
+        соединение идёт напрямую. Прокси настроен администратором, поэтому его
+        узел может быть локальным: проверку публичности адреса он проходит
+        только для самого прокси, а не для загружаемых узлов, которые
+        разрешает уже прокси.
     :param resolver: только для тестов; по умолчанию используется
         :class:`PinnedResolver`, задающий политику безопасности.
     """
 
-    def __init__(self, timeout: float = 600, *, resolver: AbstractResolver | None = None):
+    def __init__(self, timeout: float = 600, *, resolver: AbstractResolver | None = None,
+                 proxy: str | None = None):
         self._timeout = float(timeout)
         self._resolver = resolver
+        self._proxy = None if proxy is None else _validate_proxy(proxy)
         self._session: aiohttp.ClientSession | None = None
 
     async def __aenter__(self) -> SecureClient:
@@ -204,7 +231,9 @@ class SecureClient:
             raise RuntimeError("SecureClient уже открыт")
         resolver = self._resolver
         if resolver is None:
-            resolver = PinnedResolver(timeout=min(_CONNECT_TIMEOUT, self._timeout))
+            allowed = frozenset({urlsplit(self._proxy).hostname}) if self._proxy else frozenset()
+            resolver = PinnedResolver(timeout=min(_CONNECT_TIMEOUT, self._timeout),
+                                      allow_private_hosts=allowed)
         connector = aiohttp.TCPConnector(resolver=resolver)
         self._session = aiohttp.ClientSession(
             connector=connector, trust_env=False, cookie_jar=aiohttp.DummyCookieJar(),
@@ -278,7 +307,7 @@ class SecureClient:
         try:
             return await session.get(
                 url, allow_redirects=False, auto_decompress=False,
-                raise_for_status=False, timeout=timeout,
+                raise_for_status=False, timeout=timeout, proxy=self._proxy,
                 headers={"Accept-Encoding": "identity"},
                 max_line_size=_MAX_LINE_SIZE, max_field_size=_MAX_FIELD_SIZE,
                 max_headers=_MAX_HEADERS, read_bufsize=_READ_BUFSIZE,

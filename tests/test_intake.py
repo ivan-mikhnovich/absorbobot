@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import json
 from copy import deepcopy
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 import sys
@@ -444,6 +445,58 @@ def test_handle_audio_only_platform_forces_audio_mode(env):
     assert files[0]["original_name"] == "SoundCloud ethmusic/lostin-powers-she-so-heavy.m4a"
     assert sandbox.runs[0]["argv"][2] == "https://soundcloud.com/ethmusic/lostin-powers-she-so-heavy"
     assert sandbox.runs[0]["argv"][3] == "audio"
+
+
+PROXY = "http://127.0.0.1:1081"
+
+
+def test_platform_worker_receives_configured_proxy(env):
+    store, intake, sandbox = env
+    settings = replace(store.settings, download_proxy=PROXY)
+    with Store(settings) as other:
+        other.allow_user(ADMIN, ALICE)
+        other.upsert_user(ALICE, language="en")
+        instance = Intake(settings, other, intake.bot, intake.core, sandbox)
+        draft = other.create_draft(ALICE)
+        result = asyncio.run(instance.handle(payload(ALICE, draft["id"],
+                                                     text="https://youtu.be/abcdefghijk")))
+    assert result["status"] == "imported"
+    # Прокси доезжает до worker площадок последним аргументом.
+    assert sandbox.runs[0]["argv"][-1] == PROXY
+
+
+def test_external_request_carries_configured_proxy(env):
+    store, intake, sandbox = env
+    settings = replace(store.settings, download_proxy=PROXY)
+    seen = {}
+
+    async def run(work_uuid, phase, argv, **kwargs):
+        if phase == "external":
+            root = settings.storage_dir / "jobs" / work_uuid
+            request_path = root / "tmp" / Path(argv[2]).name
+            seen["proxy"] = json.loads(request_path.read_text(encoding="utf-8"))["proxy"]
+            media = root / "tmp" / (request_path.stem + ".m4a")
+            media.write_bytes(b"downloaded")
+            out = root / "tmp" / "phase-external.stdout"
+            out.write_text(json.dumps({"ok": True, "relative_path": str(media.relative_to(root)),
+                                       "role": "media", "extension": ".m4a", "bytes": 10,
+                                       "original_name": "lecture.m4a", "duration": 12.0}),
+                           encoding="utf-8")
+            return {"exit_code": 0, "stdout_path": str(out), "stderr_path": str(out),
+                    "resource_report": dict(FAKE_REPORT), "binding": {}}
+        return await original_run(work_uuid, phase, argv, **kwargs)
+
+    original_run = sandbox.run
+    sandbox.run = run
+    with Store(settings) as other:
+        other.allow_user(ADMIN, ALICE)
+        other.upsert_user(ALICE, language="en")
+        instance = Intake(settings, other, intake.bot, intake.core, sandbox)
+        draft = other.create_draft(ALICE)
+        result = asyncio.run(instance.handle(payload(
+            ALICE, draft["id"], text="https://files.example.org/lecture.m4a")))
+    assert result["status"] == "imported"
+    assert seen["proxy"] == PROXY
 
 
 def test_later_material_import_survives_private_sandbox_runtime_links(env):

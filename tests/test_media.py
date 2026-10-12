@@ -6,6 +6,7 @@ import os
 
 import pytest
 
+import absorbobot.workers.media as media_module
 from absorbobot.workers.media import (
     DownloadBudget,
     MediaError,
@@ -551,6 +552,80 @@ def test_validate_vk_metadata_rejects_live_foreign_and_unknown(fields, code):
     with pytest.raises(MediaError) as error:
         validate_metadata(vk_metadata(**fields), VK_ID, 14400, VK)
     assert str(error.value) == code
+
+
+PROXY = "http://127.0.0.1:1081"
+
+
+def work_root(tmp_path):
+    root = tmp_path / "work"
+    (root / "tmp").mkdir(parents=True)
+    return root
+
+
+def test_download_changes_route_once_after_network_failure(tmp_path, monkeypatch):
+    calls = []
+
+    def fake_attempt(root, directory, proxy, url, mode, byte_limit, max_seconds, max_work, min_free):
+        calls.append(proxy)
+        if proxy is not None:
+            raise MediaError("media_failed")
+        return {"relative_path": "tmp/media-x/media.mkv", "duration": 1.0}
+
+    monkeypatch.setattr(media_module, "_attempt", fake_attempt)
+    result = media_module.download(CANONICAL, "video", 1000, 10, 10 ** 9, 0,
+                                   proxy=PROXY, work_root=work_root(tmp_path))
+    assert result["duration"] == 1.0
+    # Прокси попробован первым, затем маршрут сменился на прямое подключение.
+    assert calls == [PROXY, None]
+
+
+def test_download_does_not_repeat_metadata_failure_on_second_route(tmp_path, monkeypatch):
+    calls = []
+
+    def fake_attempt(root, directory, proxy, url, mode, byte_limit, max_seconds, max_work, min_free):
+        calls.append(proxy)
+        raise MediaError("invalid_media_metadata")
+
+    monkeypatch.setattr(media_module, "_attempt", fake_attempt)
+    with pytest.raises(MediaError) as error:
+        media_module.download(CANONICAL, "video", 1000, 10, 10 ** 9, 0,
+                              proxy=PROXY, work_root=work_root(tmp_path))
+    assert str(error.value) == "invalid_media_metadata"
+    assert calls == [PROXY]
+
+
+def test_download_without_proxy_uses_single_direct_route(tmp_path, monkeypatch):
+    calls = []
+
+    def fake_attempt(root, directory, proxy, url, mode, byte_limit, max_seconds, max_work, min_free):
+        calls.append(proxy)
+        raise MediaError("media_failed")
+
+    monkeypatch.setattr(media_module, "_attempt", fake_attempt)
+    with pytest.raises(MediaError):
+        media_module.download(CANONICAL, "video", 1000, 10, 10 ** 9, 0, work_root=work_root(tmp_path))
+    assert calls == [None]
+
+
+def test_download_rejects_malformed_proxy_before_filesystem():
+    with pytest.raises(MediaError) as error:
+        media_module.download(CANONICAL, "video", 10, 10, 10, 10, proxy="socks5://127.0.0.1:1080")
+    assert str(error.value) == "invalid_media_url"
+
+
+def test_main_forwards_proxy_argument(monkeypatch):
+    captured = {}
+
+    def fake_download(url, mode, byte_limit, max_seconds, max_work, min_free, *, proxy=None, work_root=None):
+        captured.update({"url": url, "mode": mode, "proxy": proxy})
+        return {"ok": True}
+
+    monkeypatch.setattr(media_module, "download", fake_download)
+    assert media_module.main([CANONICAL, "video", "10", "10", "10", "10", PROXY]) == 0
+    assert captured == {"url": CANONICAL, "mode": "video", "proxy": PROXY}
+    assert media_module.main([CANONICAL, "video", "10", "10", "10", "10"]) == 0
+    assert captured["proxy"] is None
 
 
 def test_download_budget_stops_stream_without_content_length(tmp_path):

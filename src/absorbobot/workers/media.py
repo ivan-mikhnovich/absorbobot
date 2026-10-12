@@ -31,6 +31,9 @@ VIDEO_ID = re.compile(r"[A-Za-z0-9_-]{11}")
 VK_VIDEO_ID = re.compile(r"-?\d{1,20}_\d{1,20}")
 _VIDEO_HEIGHT = 1080
 
+# Сетевые отказы, при которых имеет смысл попробовать другой маршрут.
+_ROUTE_FAILURES = frozenset({"media_failed", "timeout"})
+
 
 def _url_segments(value: str, hosts: frozenset[str]) -> list[str]:
     """Разобрать простую HTTPS-ссылку площадки и вернуть сегменты её пути.
@@ -463,6 +466,24 @@ def platform_label(platform: str | None) -> str:
 _TITLE_LIMIT = 300
 
 
+def _validate_proxy(value: object) -> str:
+    """Проверить адрес прокси загрузок: http(s), узел, порт, без credentials."""
+    valid = False
+    if isinstance(value, str) and value and value.strip() == value \
+            and not any(c in value for c in ("\n", "\r", "\t", "\x00")):
+        try:
+            parsed = urlsplit(value)
+            valid = (parsed.scheme in ("http", "https") and parsed.hostname is not None
+                     and parsed.port is not None and parsed.username is None
+                     and parsed.password is None and parsed.path in ("", "/")
+                     and not parsed.query and not parsed.fragment)
+        except ValueError:
+            valid = False
+    if not valid:
+        raise MediaError("invalid_media_url")
+    return value
+
+
 def clean_title(value) -> str | None:
     """Оставить человекочитаемый заголовок без управляющих знаков или ``None``."""
     if not isinstance(value, str):
@@ -560,7 +581,7 @@ def _progress_module():
     return module
 
 
-def _downloader(platform: Platform, options: dict):
+def _downloader(platform: Platform, options: dict, proxy: str | None = None):
     """Открыть yt-dlp с экстракторами только выбранной площадки."""
     from yt_dlp import YoutubeDL
     from yt_dlp.globals import all_plugins_loaded, plugin_dirs
@@ -575,6 +596,8 @@ def _downloader(platform: Platform, options: dict):
         "socket_timeout": 30, "retries": 3,
         **options,
     }
+    if proxy is not None:
+        parameters["proxy"] = _validate_proxy(proxy)
     downloader = YoutubeDL(parameters, auto_init=False)
     for dotted in platform.extractors:
         module, _, name = dotted.rpartition(".")
@@ -583,7 +606,7 @@ def _downloader(platform: Platform, options: dict):
 
 
 def _download(platform: Platform, url: str, media_id: str, mode: str, byte_limit: int,
-              max_seconds: float, directory: Path) -> dict:
+              max_seconds: float, directory: Path, proxy: str | None = None) -> dict:
     mode_spec = platform.modes[mode]
     reporter = _progress_module().ProgressWriter(directory.parent.parent, "media", "bytes",
                                                  min_interval=0.5)
@@ -596,7 +619,7 @@ def _download(platform: Platform, url: str, media_id: str, mode: str, byte_limit
         "format": mode_spec.selector, "merge_output_format": "mkv",
         "postprocessors": list(mode_spec.postprocessors),
     }
-    with _downloader(platform, options) as downloader:
+    with _downloader(platform, options, proxy) as downloader:
         info = downloader.extract_info(url, download=False, process=False)
         metadata = validate_metadata(info, media_id, max_seconds, platform)
         # Обработка только уже проверенного результата площадки, без повторного arbitrary URL.
@@ -615,10 +638,10 @@ def _download(platform: Platform, url: str, media_id: str, mode: str, byte_limit
     return {"relative_path": str(output.relative_to(directory.parent.parent)), **metadata}
 
 
-def lookup(url: str, max_seconds: float) -> dict:
+def lookup(url: str, max_seconds: float, proxy: str | None = None) -> dict:
     """Прочитать метаданные записи без загрузки файла для восстановления подписи."""
     platform, canonical, media_id = resolve_media_url(url)
-    with _downloader(platform, {}) as downloader:
+    with _downloader(platform, {}, proxy) as downloader:
         info = downloader.extract_info(canonical, download=False, process=False)
         return validate_metadata(info, media_id, max_seconds, platform)
 
@@ -652,17 +675,15 @@ def _stop_child(process: subprocess.Popen) -> None:
     psutil.wait_procs(alive, timeout=10)
 
 
-def download(url: str, mode: str, byte_limit: int, max_seconds: float,
-             max_work_bytes: int, min_free_bytes: int, *, work_root: Path = Path("/work")) -> dict:
-    platform, _, _ = resolve_media_url(url)
-    if mode not in platform.modes:
-        raise MediaError("invalid_media_url")
-    root = work_root.resolve(strict=True)
-    directory = root / "tmp" / ("media-" + uuid4().hex)
-    directory.mkdir(mode=0o700)
+def _attempt(root: Path, directory: Path, proxy: str | None, url: str, mode: str,
+             byte_limit: int, max_seconds: float, max_work_bytes: int,
+             min_free_bytes: int) -> dict:
+    """Запустить дочернюю загрузку по одному маршруту и дождаться её результата."""
     result_path = directory / "result.json"
     command = [sys.executable, str(Path(__file__).absolute()), "--child", url,
                mode, str(byte_limit), str(max_seconds), str(directory)]
+    if proxy is not None:
+        command.append(proxy)
     with (directory / "downloader.stdout.log").open("xb") as stdout, (directory / "downloader.stderr.log").open("xb") as stderr:
         process = subprocess.Popen(command, stdin=subprocess.DEVNULL,
                                    stdout=stdout, stderr=stderr)
@@ -696,6 +717,37 @@ def download(url: str, mode: str, byte_limit: int, max_seconds: float,
         _stop_child(process)
 
 
+def download(url: str, mode: str, byte_limit: int, max_seconds: float,
+             max_work_bytes: int, min_free_bytes: int, *, proxy: str | None = None,
+             work_root: Path = Path("/work")) -> dict:
+    """Скачать запись, пробуя прокси и запасное прямое подключение.
+
+    Часть площадок доступна только из одной сети: прокси помогает одним,
+    а прямое соединение — другим. Маршрут меняется один раз и только при
+    сетевом отказе: проверки ссылки, метаданных и пределов от маршрута
+    не зависят и повторяются бессмысленно.
+    """
+    platform, _, _ = resolve_media_url(url)
+    if mode not in platform.modes:
+        raise MediaError("invalid_media_url")
+    if proxy is not None:
+        _validate_proxy(proxy)
+    root = work_root.resolve(strict=True)
+    routes = [None] if proxy is None else [proxy, None]
+    failure: MediaError | None = None
+    for route in routes:
+        directory = root / "tmp" / ("media-" + uuid4().hex)
+        directory.mkdir(mode=0o700)
+        try:
+            return _attempt(root, directory, route, url, mode, byte_limit,
+                            max_seconds, max_work_bytes, min_free_bytes)
+        except MediaError as exc:
+            failure = exc
+            if route is None or str(exc) not in _ROUTE_FAILURES:
+                raise
+    raise failure if failure is not None else MediaError("media_failed")
+
+
 def _result_error(exc: Exception) -> dict:
     code = str(exc) if isinstance(exc, MediaError) else "media_failed"
     return {"ok": False, "error": code}
@@ -705,21 +757,24 @@ def main(argv: list[str] | None = None) -> int:
     args = sys.argv[1:] if argv is None else argv
     if args and args[0] == "--metadata":
         try:
-            if len(args) != 3:
+            if len(args) not in (3, 4):
                 raise MediaError("media_failed")
-            result = {"ok": True, **lookup(args[1], float(args[2]))}
+            proxy = args[3] if len(args) == 4 else None
+            result = {"ok": True, **lookup(args[1], float(args[2]), proxy)}
         except Exception as exc:
             result = _result_error(exc)
         print(json.dumps(result, allow_nan=False))
         return 0 if result["ok"] else 2
     if args and args[0] == "--child":
-        directory = Path(args[-1])
+        # Каталог результата задаёт родитель; прокси добавляется только при настройке.
+        directory = Path(args[5]) if len(args) >= 6 else Path(args[-1])
+        proxy = args[6] if len(args) == 7 else None
         try:
-            if len(args) != 6:
+            if len(args) not in (6, 7):
                 raise MediaError("media_failed")
             platform, canonical, media_id = resolve_media_url(args[1])
             result = {"ok": True, **_download(platform, canonical, media_id, args[2],
-                                              int(args[3]), float(args[4]), directory)}
+                                              int(args[3]), float(args[4]), directory, proxy)}
         except Exception as exc:
             detail = re.sub(r"(?<=://)[^\s/]+@", "<redacted>@", str(exc))
             print(f"{type(exc).__name__}: {detail}", file=sys.stderr)
@@ -729,9 +784,11 @@ def main(argv: list[str] | None = None) -> int:
         temporary.replace(directory / "result.json")
         return 0 if result["ok"] else 2
     try:
-        if len(args) != 6:
+        if len(args) not in (6, 7):
             raise MediaError("media_failed")
-        result = download(args[0], args[1], int(args[2]), float(args[3]), int(args[4]), int(args[5]))
+        proxy = args[6] if len(args) == 7 else None
+        result = download(args[0], args[1], int(args[2]), float(args[3]), int(args[4]), int(args[5]),
+                          proxy=proxy)
         print(json.dumps(result, allow_nan=False))
         return 0
     except Exception as exc:

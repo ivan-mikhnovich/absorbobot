@@ -137,6 +137,30 @@ class _FakeGetaddr:
         return self._answer
 
 
+def test_client_rejects_malformed_proxy_before_any_connection():
+    for value in ("", "socks5://127.0.0.1:1080", "127.0.0.1:1081", "http://127.0.0.1",
+                  "http://user:pass@127.0.0.1:1081", "http://127.0.0.1:1081/path", 42):
+        with pytest.raises(FetchError) as error:
+            SecureClient(timeout=1, proxy=value)
+        assert error.value.code == "invalid_url"
+
+
+def test_proxy_host_may_be_private_but_others_stay_strict(monkeypatch):
+    monkeypatch.setattr(socket, "getaddrinfo", _FakeGetaddr(_infos("127.0.0.1")))
+
+    async def allowed():
+        return await PinnedResolver(timeout=1, allow_private_hosts=frozenset({"proxy.local"})).resolve("proxy.local", 1081)
+
+    async def rejected():
+        with pytest.raises(FetchError) as error:
+            await PinnedResolver(timeout=1, allow_private_hosts=frozenset({"proxy.local"})).resolve("other.test", 443)
+        return error.value.code
+
+    results = asyncio.run(allowed())
+    assert [entry["host"] for entry in results] == ["127.0.0.1"]
+    assert asyncio.run(rejected()) == "unsafe_url"
+
+
 def test_pinned_resolver_returns_only_verified_addresses(monkeypatch):
     monkeypatch.setattr(socket, "getaddrinfo", _FakeGetaddr(_infos("8.8.8.8", "1.1.1.1")))
 

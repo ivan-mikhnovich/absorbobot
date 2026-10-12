@@ -80,12 +80,17 @@ class FakeTransport:
 
     FetchError = FakeFetchError
 
-    def __init__(self, routes: dict):
+    def __init__(self, routes: dict, *, proxy_failure: str | None = None):
         self.routes = {url: list(responses) for url, responses in routes.items()}
         self.calls: list[str] = []
+        self.proxies: list[str | None] = []
+        # Код отказа, который транспорт отдаёт только на маршруте прокси.
+        self.proxy_failure = proxy_failure
 
-    def SecureClient(self, timeout=None):
+    def SecureClient(self, timeout=None, proxy=None):
         self.timeout = timeout
+        self.proxies.append(proxy)
+        self.proxy = proxy
         return self
 
     async def __aenter__(self):
@@ -96,6 +101,8 @@ class FakeTransport:
 
     def open(self, url: str):
         self.calls.append(url)
+        if self.proxy is not None and self.proxy_failure is not None:
+            raise FakeFetchError(self.proxy_failure)
         pending = self.routes.get(url)
         if not pending:
             raise FakeFetchError("download_failed")
@@ -261,6 +268,44 @@ def test_fetch_direct_file_writes_under_tmp(tmp_path):
     written = tmp_path / result["relative_path"]
     assert written.is_file() and written.read_bytes() == b"%PDF-1.7 content"
     assert transport.calls == [CANONICAL_DIRECT]
+
+
+PROXY = "http://127.0.0.1:1081"
+
+
+def test_download_prefers_proxy_and_keeps_direct_as_fallback(tmp_path):
+    value = request(proxy=PROXY)
+    routes = {CANONICAL_DIRECT: [_Response([b"%PDF-1.7 content"], {"Content-Type": "application/pdf"})]}
+    transport = FakeTransport(routes)
+    result = asyncio.run(external.download(value, root=tmp_path, transport=transport))
+    assert result["ok"] is True
+    assert transport.proxies == [PROXY]
+
+
+def test_download_falls_back_to_direct_after_network_failure_on_proxy(tmp_path):
+    value = request(proxy=PROXY)
+    routes = {CANONICAL_DIRECT: [_Response([b"%PDF-1.7 content"], {"Content-Type": "application/pdf"})]}
+    transport = FakeTransport(routes, proxy_failure="timeout")
+    result = asyncio.run(external.download(value, root=tmp_path, transport=transport))
+    assert result["ok"] is True
+    # Прокси попробован первым, затем маршрут сменился на прямое подключение.
+    assert transport.proxies == [PROXY, None]
+
+
+def test_download_does_not_repeat_request_checks_on_second_route(tmp_path):
+    value = request(proxy=PROXY)
+    transport = FakeTransport({}, proxy_failure="unsafe_url")
+    with pytest.raises(ExternalError) as error:
+        asyncio.run(external.download(value, root=tmp_path, transport=transport))
+    assert str(error.value) == "unsafe_url"
+    assert transport.proxies == [PROXY]
+
+
+def test_download_without_proxy_uses_single_direct_route(tmp_path):
+    routes = {CANONICAL_DIRECT: [_Response([b"%PDF-1.7 content"], {"Content-Type": "application/pdf"})]}
+    transport = FakeTransport(routes)
+    asyncio.run(external.download(request(), root=tmp_path, transport=transport))
+    assert transport.proxies == [None]
 
 
 def test_fetch_direct_uses_content_disposition_name(tmp_path):

@@ -285,7 +285,9 @@ class Sandbox:
             raise SandboxError("invalid_environment")
         values = {key: supplied.get(key, os.environ.get(key)) for key in _PUBLIC_ENV}
         clean = {key: value for key, value in values.items()
-                 if isinstance(value, str) and "\x00" not in value and (network or key not in _PROXY_ENV)}
+                 if isinstance(value, str) and "\x00" not in value and key not in _PROXY_ENV}
+        # Прокси задаётся только явной настройкой: окружение ненадёжно и не должно
+        # менять маршрут загрузок незаметно для администратора.
         clean.update({
             "PATH": f"{environment}/bin:/usr/bin:/bin", "LANG": clean.get("LANG", "C.UTF-8"),
             "HOME": "/work/tmp/home", "TMPDIR": "/work/tmp", "TMP": "/work/tmp", "TEMP": "/work/tmp",

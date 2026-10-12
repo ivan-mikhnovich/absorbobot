@@ -621,7 +621,8 @@ class Intake:
                    "python_base_prefix": sys.base_prefix}
         result = await self.sandbox.run(
             work_uuid, "media", [runtime["python_executable"], "/workers/media.py",
-            "--metadata", canonical, str(self.settings.max_media_seconds)],
+            "--metadata", canonical, str(self.settings.max_media_seconds)]
+            + ([self.settings.download_proxy] if self.settings.download_proxy else []),
             runtime=runtime, env={}, network=True, selected_key_names=(),
             timeout=min(600, self.settings.max_processing_seconds))
         data = _worker_result(result)
@@ -690,7 +691,8 @@ class Intake:
                         result = await self.sandbox.run(
                             work_uuid, "media", [runtime["python_executable"], "/workers/media.py",
                             url, mode, str(limit), str(self.settings.max_media_seconds),
-                            str(self.settings.max_work_bytes), str(self.settings.min_free_bytes)],
+                            str(self.settings.max_work_bytes), str(self.settings.min_free_bytes)]
+                            + ([self.settings.download_proxy] if self.settings.download_proxy else []),
                             runtime=runtime, env={}, network=True, selected_key_names=(),
                             timeout=self.settings.max_processing_seconds)
                         outcome["resources"] = _phase_resources(result.get("resource_report"), "input_media")
@@ -721,7 +723,8 @@ class Intake:
                                "max_material_bytes": self.settings.max_material_bytes,
                                "remaining_material_bytes": max(0, self.settings.max_material_bytes - material_bytes),
                                "max_work_bytes": self.settings.max_work_bytes,
-                               "min_free_bytes": self.settings.min_free_bytes}, handle)
+                               "min_free_bytes": self.settings.min_free_bytes,
+                               "proxy": self.settings.download_proxy}, handle)
                 cleanup.append(request)
                 async with self._operation(owner, work_uuid, "external") as outcome:
                     async with self._track(owner, work_uuid, root, "external", "bytes") as track:

@@ -1,6 +1,7 @@
 """Границы настроек, секретов и запрета SSD fallback."""
 
 from dataclasses import replace
+import json
 from pathlib import Path
 from types import SimpleNamespace
 from uuid import uuid4
@@ -20,6 +21,32 @@ def mounted(monkeypatch, settings, *, free=1000, readonly=False):
     monkeypatch.setattr(config.os.path, "ismount", lambda p: p == settings.backing_mount)
     monkeypatch.setattr(config.psutil, "disk_partitions", lambda all: [SimpleNamespace(mountpoint=str(settings.backing_mount), fstype="fuseblk")])
     monkeypatch.setattr(config.os, "statvfs", lambda p: SimpleNamespace(f_bavail=free, f_frsize=1, f_flag=config.os.ST_RDONLY if readonly else 0))
+
+
+@pytest.mark.parametrize("value", [
+    "", "  ", "127.0.0.1:1081", "socks5://127.0.0.1:1080", "http://127.0.0.1",
+    "http://user:pass@127.0.0.1:1081", "http://127.0.0.1:1081/path",
+    "http://127.0.0.1:1081?x=1", "http://127.0.0.1:1081#f", 1081, " http://127.0.0.1:1081",
+])
+def test_download_proxy_rejects_malformed_values(tmp_path, value):
+    body = f"admin_ids: [1]\ndownload_proxy: {json.dumps(value)}\n"
+    path = tmp_path / "config.yaml"
+    path.write_text(body, encoding="utf-8")
+    with pytest.raises(config.ConfigError):
+        config.load_settings(path)
+
+
+@pytest.mark.parametrize("value", ["http://127.0.0.1:1081", "https://proxy.example:8443"])
+def test_download_proxy_accepts_http_and_https(tmp_path, value):
+    path = tmp_path / "config.yaml"
+    path.write_text(f"admin_ids: [1]\ndownload_proxy: {json.dumps(value)}\n", encoding="utf-8")
+    assert config.load_settings(path).download_proxy == value
+
+
+def test_download_proxy_defaults_to_direct_connection(tmp_path):
+    path = tmp_path / "config.yaml"
+    path.write_text("admin_ids: [1]\n", encoding="utf-8")
+    assert config.load_settings(path).download_proxy is None
 
 
 @pytest.mark.parametrize("body", ["[]", "null", "admin_ids: []", "admin_ids: [true]", "admin_ids: [-1]", "admin_ids: [1]\nunknown: 2", "storage_dir: /media/storage/absorbobot", "admin_ids: [1]\nquota_jobs: 0", "admin_ids: [1]\nquota_jobs: 1.1"])

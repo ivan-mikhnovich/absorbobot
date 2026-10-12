@@ -45,6 +45,7 @@ class Settings:
     max_work_bytes: int = 100000000000
     max_processing_seconds: int = 21600
     metrics_interval_seconds: float = 1
+    download_proxy: str | None = None
     backing_mount: Path = Path("/media/storage")
     secrets_file: Path = Path("~/.config/absorbobot/secrets.env")
     api_binary: Path = Path("~/.local/libexec/absorbobot/bin/telegram-bot-api")
@@ -72,6 +73,7 @@ class Settings:
         if isinstance(interval, bool) or not isinstance(interval, (float, int)) or not math.isfinite(interval) or interval <= 0:
             raise ConfigError("metrics_interval_seconds должен быть конечным положительным числом.")
         _validate_api_url(self.bot_api_url)
+        object.__setattr__(self, "download_proxy", _validate_download_proxy(self.download_proxy))
         mount = self.backing_mount.resolve()
         storage = self.storage_dir.resolve()
         if mount == Path("/") or not storage.is_relative_to(mount) or storage == mount:
@@ -112,6 +114,31 @@ def _validate_api_url(value: str) -> None:
         valid = False
     if not valid:
         raise ConfigError("bot_api_url должен быть https://api.telegram.org или HTTP loopback адресом на порту 8081 без credentials, пути или параметров.")
+
+
+def _validate_download_proxy(value: object) -> str | None:
+    """Проверить необязательный прокси загрузок: только http(s) без credentials.
+
+    Прокси применяется и к публичным ссылкам, и к загрузкам площадок, поэтому
+    поддерживается ровно то, что умеют оба транспорта. Учётные данные
+    запрещены: значение попадает в аргументы дочернего процесса и видно
+    в списке процессов.
+    """
+    if value is None:
+        return None
+    valid = False
+    if isinstance(value, str) and value and value.strip() == value \
+            and not any(c in value for c in ("\n", "\r", "\t", "\x00")):
+        try:
+            url = urlsplit(value)
+            valid = (url.scheme in ("http", "https") and url.hostname is not None
+                     and url.port is not None and url.username is None and url.password is None
+                     and url.path in ("", "/") and not url.query and not url.fragment)
+        except ValueError:
+            valid = False
+    if not valid:
+        raise ConfigError("download_proxy должен быть адресом прокси вида http://host:port без credentials, пути и параметров.")
+    return value
 
 
 def load_settings(path: str | Path) -> Settings:

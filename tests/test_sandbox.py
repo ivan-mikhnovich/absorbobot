@@ -137,7 +137,8 @@ def test_environment_allowlist_and_network_proxy(settings, store, tmp_path, monk
     box = make_box(settings, store)
     online = box.build_environment("analyze", runtime=runtime, network=True)
     assert online["LANG"] == "ru_RU.UTF-8"
-    assert online["HTTPS_PROXY"] == "http://proxy.example:3128"
+    # Маршрут загрузок задаёт только явная настройка, а не окружение.
+    assert "HTTPS_PROXY" not in online
     assert "SECRET_TOKEN" not in online
     assert online["HOME"] == "/work/tmp/home"
     assert online["TMPDIR"] == "/work/tmp"

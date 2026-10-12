@@ -17,3 +17,6 @@ min_free_bytes: 50000000000
 max_work_bytes: 100000000000
 max_processing_seconds: 21600
 metrics_interval_seconds: 1
+# Необязательный прокси загрузок: http(s)://host:port без credentials.
+# Сначала загрузка идёт через него, при сетевом отказе — напрямую.
+# download_proxy: http://127.0.0.1:1081

@@ -49,6 +49,9 @@ _GOOGLE_FORM_FIELDS = ("id", "export", "confirm", "uuid")
 
 _EXTENSION = re.compile(r"\.[a-z0-9]+")
 
+# Сетевые отказы, при которых имеет смысл попробовать другой маршрут.
+_ROUTE_FAILURES = frozenset({"timeout", "download_failed"})
+
 # Расширение по типу содержимого, когда имя файла не даёт решения.
 _CONTENT_TYPES = {
     "application/pdf": ".pdf",
@@ -450,10 +453,12 @@ async def _write_stream(response, path: Path, limit: int, *, root: Path,
 
 async def _run(url: str, tmp: Path, root: Path, media: set[str], material: set[str],
                max_media: int, max_material: int, remaining: int, max_work: int,
-               min_free: int, transport, timeout: float, download_id: str) -> dict:
+               min_free: int, transport, timeout: float, download_id: str,
+               proxy: str | None = None) -> dict:
     """Разрешить провайдера, определить роль и скачать ровно один файл."""
     async with AsyncExitStack() as stack:
-        client = await stack.enter_async_context(transport.SecureClient(timeout=timeout))
+        client = await stack.enter_async_context(
+            transport.SecureClient(timeout=timeout, proxy=proxy))
         provider = _provider_of(url)
         google_id = ""
         declared: int | None = None
@@ -503,6 +508,15 @@ async def _run(url: str, tmp: Path, root: Path, media: set[str], material: set[s
             raise
         return {"ok": True, "relative_path": str(path.relative_to(root)), "extension": extension,
                 "role": role, "original_name": original_name, "bytes": written}
+
+
+def _optional_proxy(value: object) -> str | None:
+    """Прочитать необязательный адрес прокси: строка вида http://host:port."""
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value:
+        raise ExternalError("invalid_url")
+    return value
 
 
 def _int_field(request: dict, key: str) -> int:
@@ -569,10 +583,11 @@ async def fetch(request: dict, *, root: Path | None = None, transport=None) -> d
     module = transport or _load_transport()
     transport_error = getattr(module, "FetchError", None)
     discard = _progress_module().discard_progress
+    proxy = _optional_proxy(request.get("proxy"))
     try:
         return await asyncio.wait_for(
             _run(url, tmp, base, media, material, max_media, max_material,
-                 remaining, max_work, min_free, module, float(timeout), download_id), timeout)
+                 remaining, max_work, min_free, module, float(timeout), download_id, proxy), timeout)
     except asyncio.TimeoutError:
         discard(base, "external")
         raise ExternalError("timeout") from None
@@ -586,6 +601,25 @@ async def fetch(request: dict, *, root: Path | None = None, transport=None) -> d
             raise ExternalError(code if isinstance(code, str) and code in _SAFE_CODES
                                 else "download_failed") from None
         raise
+
+
+async def download(request: dict, *, root: Path | None = None, transport=None) -> dict:
+    """Скачать файл, пробуя настроенный прокси и запасное прямое подключение.
+
+    Часть площадок доступна только из одной сети: прокси помогает одним,
+    а прямое соединение — другим, поэтому при сетевом отказе маршрут меняется
+    один раз. Ошибки проверок запроса не повторяются: они не зависят от
+    маршрута, а повторный отказ остаётся отказом второго маршрута.
+    """
+    proxy = request.get("proxy")
+    if not proxy:
+        return await fetch(request, root=root, transport=transport)
+    try:
+        return await fetch(request, root=root, transport=transport)
+    except ExternalError as exc:
+        if str(exc) not in _ROUTE_FAILURES:
+            raise
+        return await fetch({**request, "proxy": None}, root=root, transport=transport)
 
 
 def _error_result(exc: Exception) -> dict:
@@ -614,7 +648,7 @@ def main(argv: list[str] | None = None) -> int:
     args = sys.argv[1:] if argv is None else list(argv)
     try:
         request = json.loads(_read_request(args))
-        result = asyncio.run(fetch(request))
+        result = asyncio.run(download(request))
     except json.JSONDecodeError:
         result = {"ok": False, "error": "invalid_file_metadata"}
     except Exception as exc:
