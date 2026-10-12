@@ -49,6 +49,13 @@ systemctl --user restart absorbobot.service
   `journalctl --user -u absorbobot.service`.
 - Процедура выпуска ядра, установки и проверки доказательствами без Telegram —
   в skill `absorbent-release-deploy`.
+- Запись оператора `~/.local/state/absorbobot/deployment.json` ведётся руками:
+  кода, который её читает или пишет, нет. После развёртывания в ней обновляют
+  текущие `bot` и `core` (версия, commit, tag, адрес и digest wheel ядра) и
+  раздел текущего выпуска с проверками; историю проверок не переписывают.
+- Правки только документации (`README.md`, `AGENTS.md`) после установки не
+  требуют повторной установки и перезапуска службы: wheel их не содержит,
+  поэтому commit в receipt — это коммит установленного кода, а не HEAD.
 
 ## Связка с ядром
 
