@@ -60,6 +60,8 @@ class UpdateRouter:
                     self.dialog.handle_callback(payload)
             else:
                 payload = message.model_dump(mode="json", by_alias=True, exclude_none=True, exclude_unset=True)
+                # Живой отчёт обязан оставаться последним сообщением чата: запомнить его конец.
+                self.store.record_chat_tail(message.chat.id, message.message_id)
                 if not self.admin.handle_message(payload):
                     self.dialog.handle_message(payload)
         return self.store.process_update(update.update_id, mutate)
@@ -79,8 +81,8 @@ class UpdateRouter:
 class TelegramOutbox:
     """Отправить сохранённые действия без повторения оплаченной обработки."""
 
-    METHODS = frozenset({"send_message", "send_photo", "send_document", "send_media_group",
-                         "edit_message_text", "answer_callback_query"})
+    METHODS = frozenset({"send_message", "send_rich_message", "send_photo", "send_document", "send_media_group",
+                         "edit_message_text", "delete_message", "answer_callback_query"})
     PROGRESS_INTERVAL = timedelta(seconds=5)
 
     def __init__(self, bot: Bot, store: Store):
@@ -94,23 +96,17 @@ class TelegramOutbox:
         return json.loads(row["payload"])
 
     def _progress_state(self, work_uuid: str) -> dict:
-        """Действия прогресса одного задания: ожидающие, время отправки и корневое сообщение."""
-        rows = self.store.db.execute(
-            "SELECT id,status,sent_at,payload,result FROM outbox WHERE kind='telegram' "
-            "AND json_extract(payload,'$.purpose')='progress' "
-            "AND json_extract(payload,'$.work_uuid')=? ORDER BY id",
-            (work_uuid,),
-        ).fetchall()
+        """Действия прогресса одного задания: ожидающие, время отправки и живое сообщение."""
         pending, last_sent_at, message_id = [], None, None
-        for row in rows:
-            payload = json.loads(row["payload"])
+        for row in self.store.progress_actions(work_uuid):
+            payload = row["payload"]
             if row["status"] == "pending":
                 pending.append({"id": row["id"], "payload": payload})
                 continue
-            result = json.loads(row["result"]) if row["result"] else {}
+            result = row["result"] or {}
             if result.get("progress") and row["sent_at"]:
                 last_sent_at = row["sent_at"]
-            if payload.get("method") == "send_message" and result.get("message_id"):
+            if payload.get("method") in ("send_message", "send_rich_message") and result.get("message_id"):
                 message_id = result["message_id"]
         return {"pending": pending, "last_sent_at": last_sent_at, "message_id": message_id}
 
@@ -120,11 +116,43 @@ class TelegramOutbox:
             if row["id"] != representative:
                 self.store.outbox_sent(row["id"], {"skipped": "superseded", "superseded_by": representative})
 
+    def _drop_progress_message(self, owner: int, work_uuid: str, message_id: int) -> None:
+        """Убрать отставший отчёт: причина и результат приходят отдельными сообщениями."""
+        self.store.forget_progress_message(work_uuid, message_id, "report_moved")
+        self.store.add_outbox("telegram", {
+            "owner_id": owner, "method": "delete_message",
+            "kwargs": {"chat_id": owner, "message_id": message_id},
+        }, dedupe_key=f"progress-drop:{work_uuid}:{message_id}")
+
+    def _progress_target(self, owner: int, payload: dict, message_id: int | None,
+                         reply_to: int | None) -> tuple[str, dict, dict | None]:
+        """Выбрать отправку или правку живой строки и её текстовый запасной вид."""
+        rich = payload["kwargs"].get("rich_message")
+        text = payload.get("text") or ""
+        if message_id is not None:
+            kwargs = {"chat_id": owner, "message_id": message_id}
+            if rich:
+                # Отказ правки лечит пересылка строки заново, а не второй вид той же правки.
+                return "edit_message_text", dict(kwargs, rich_message=rich), None
+            return "edit_message_text", dict(kwargs, text=text), None
+        reply = {"message_id": reply_to, "allow_sending_without_reply": True} if reply_to else None
+        if rich:
+            kwargs = {"chat_id": owner, "rich_message": rich}
+            plain = {"chat_id": owner, "text": text}
+            if reply:
+                kwargs["reply_parameters"] = reply
+                plain["reply_parameters"] = reply
+            return "send_rich_message", kwargs, {"method": "send_message", "kwargs": plain}
+        kwargs = {"chat_id": owner, "text": text}
+        if reply:
+            kwargs["reply_parameters"] = reply
+        return "send_message", kwargs, None
+
     async def _send_progress(self, item: dict, payload: dict) -> None:
         item_id, owner = item["id"], payload["owner_id"]
         work_uuid = payload["work_uuid"]
-        job = self.store.get_job(work_uuid) or self.store.get_draft(work_uuid)
-        if not job or job["owner_id"] != owner:
+        work = self.store.get_job(work_uuid) or self.store.get_draft(work_uuid)
+        if not work or work["owner_id"] != owner:
             # Прогресс не должен уходить чужому владельцу или несуществующему заданию.
             self.store.outbox_sent(item_id, {"skipped": "owner_mismatch"})
             return
@@ -132,29 +160,18 @@ class TelegramOutbox:
         pending = state["pending"]
         if not pending:
             return
-        root = next((row for row in reversed(pending) if row["payload"].get("method") == "send_message"), None)
-        # Корневое сообщение остаётся единственным: пока нет message_id отправляем именно его.
-        representative = root["id"] if state["message_id"] is None and root else pending[-1]["id"]
-        if item_id != representative:
-            self.store.outbox_sent(item_id, {"skipped": "superseded", "superseded_by": representative})
+        if item_id != pending[-1]["id"]:
+            # Действует только свежая строка: устаревшие правки одного состояния не нужны.
+            self.store.outbox_sent(item_id, {"skipped": "superseded", "superseded_by": pending[-1]["id"]})
             return
-        self._supersede(pending, representative)
-        text = pending[-1]["payload"]["kwargs"]["text"]
-        method = payload["method"]
-        if method == "send_message" and state["message_id"] is not None:
-            # Корневое сообщение уже отправлено, повторная отправка создала бы второе.
-            method = "edit_message_text"
-        if method == "edit_message_text":
-            if state["message_id"] is None:
-                self.store.outbox_sent(item_id, {"skipped": "missing_message"})
-                return
-            kwargs = {"chat_id": owner, "message_id": state["message_id"], "text": text}
-        else:
-            kwargs = dict(payload["kwargs"])
-            kwargs["text"] = text
-            if "chat_id" in kwargs and kwargs["chat_id"] != owner:
-                raise ValueError("Outbox recipient does not match owner.")
-        if state["last_sent_at"] is not None:
+        self._supersede(pending, item_id)
+        payload = pending[-1]["payload"]
+        message_id = state["message_id"]
+        if message_id is not None and self.store.chat_tail(owner) > message_id:
+            # Отчёт обязан быть последним сообщением чата: отставшее убрать, новое поставить заново.
+            self._drop_progress_message(owner, work_uuid, message_id)
+            message_id = None
+        if state["last_sent_at"] is not None and message_id is not None:
             deadline = datetime.fromisoformat(state["last_sent_at"]) + self.PROGRESS_INTERVAL
             if utc_now() < deadline:
                 # Сдвигаем только срок: попытки не тратятся, сетевые задержки не укорачиваются.
@@ -162,7 +179,18 @@ class TelegramOutbox:
                     self.store.db.execute("UPDATE outbox SET available_at=? WHERE id=? AND status='pending'",
                                           (_utc(deadline), item_id))
                 return
-        await self._dispatch(item, method, kwargs, extra={"progress": True})
+        method, kwargs, fallback = self._progress_target(owner, payload, message_id, work["source_message_id"])
+        outcome = await self._dispatch(item, method, kwargs, extra={"progress": True},
+                                       on_bad_request="fail", payload=payload, fallback=fallback)
+        if outcome == "rejected" and method == "edit_message_text":
+            # Сообщения отчёта больше нет: забыть его и поставить строку заново.
+            self.store.forget_progress_message(work_uuid, message_id, "message_gone")
+            again, kwargs, fallback = self._progress_target(owner, payload, None, work["source_message_id"])
+            action = {"owner_id": owner, "method": again, "purpose": "progress",
+                      "work_uuid": work_uuid, "kwargs": kwargs, "text": payload.get("text") or ""}
+            if fallback is not None:
+                action["fallback"] = fallback
+            self.store.add_outbox("telegram", action)
 
     async def send(self, item: dict) -> None:
         payload = self._fresh_payload(item["id"])
@@ -233,22 +261,46 @@ class TelegramOutbox:
                     media=FSInputFile(path, filename=file.get("filename", path.name)),
                     caption=payload.get("caption") if position == 0 else None))
             kwargs["media"] = media
-        await self._dispatch(item, method, kwargs)
+        await self._dispatch(item, method, kwargs, payload=payload)
 
-    async def _dispatch(self, item: dict, method: str, kwargs: dict, *, extra: dict | None = None) -> None:
+    async def _dispatch(self, item: dict, method: str, kwargs: dict, *, extra: dict | None = None,
+                        on_bad_request: str = "retry", payload: dict | None = None,
+                        fallback: dict | None = None) -> str:
+        """Выполнить действие Telegram и вернуть исход, решающий судьбу живого отчёта."""
+        if fallback is None and payload is not None:
+            fallback = payload.get("fallback")
         try:
             response = await getattr(self.bot, method)(**kwargs)
         except TelegramRetryAfter as exc:
             self.store.outbox_retry(item["id"], utc_now() + timedelta(seconds=exc.retry_after), "telegram_rate_limit")
+            return "retry"
         except (TelegramNetworkError, TelegramServerError):
             delay = min(300, 2 ** min(item["attempts"] + 1, 8))
             self.store.outbox_retry(item["id"], utc_now() + timedelta(seconds=delay), "telegram_transport")
+            return "retry"
         except (TelegramBadRequest, TelegramForbiddenError) as exc:
             if method == "answer_callback_query":
                 # Истёкший callback не должен бесконечно задерживать собственный outbox.
                 self.store.outbox_sent(item["id"], {"expired": True})
-            else:
-                self.store.outbox_retry(item["id"], utc_now() + timedelta(seconds=300), type(exc).__name__)
+                return "rejected"
+            if method == "delete_message":
+                # Сообщение уже убрано владельцем: повторять удаление нечего.
+                self.store.outbox_sent(item["id"], {"skipped": "already_gone"})
+                return "rejected"
+            fallback = fallback if isinstance(fallback, dict) else None
+            if isinstance(fallback, dict) and isinstance(fallback.get("method"), str):
+                # Богатая разметка не принята: та же строка уходит обычным текстом.
+                self.store.outbox_sent(item["id"], {"skipped": "rich_rejected_" + type(exc).__name__})
+                action = {key: payload[key] for key in ("owner_id", "purpose", "work_uuid", "text")
+                          if payload.get(key) is not None}
+                action.update({"method": fallback["method"], "kwargs": fallback["kwargs"]})
+                self.store.add_outbox("telegram", action)
+                return "rejected"
+            if on_bad_request == "fail":
+                self.store.outbox_sent(item["id"], {"skipped": "rejected_" + type(exc).__name__})
+                return "rejected"
+            self.store.outbox_retry(item["id"], utc_now() + timedelta(seconds=300), type(exc).__name__)
+            return "retry"
         else:
             # Альбом отвечает списком сообщений: сохранить идентификатор первого.
             identifier = response.message_id if hasattr(response, "message_id") else None
@@ -258,6 +310,9 @@ class TelegramOutbox:
             if extra:
                 result.update(extra)
             self.store.outbox_sent(item["id"], result)
+            # Живой отчёт обязан оставаться последним: помнить конец чата и после отправки.
+            self.store.record_chat_tail(kwargs.get("chat_id"), identifier)
+            return "sent"
 
     async def run(self, stop: asyncio.Event) -> None:
         while not stop.is_set():

@@ -143,6 +143,9 @@ CREATE TABLE IF NOT EXISTS process_bindings (
 CREATE TABLE IF NOT EXISTS store_settings (
     key TEXT PRIMARY KEY, value TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS chat_tails (
+    chat_id INTEGER PRIMARY KEY, last_message_id INTEGER NOT NULL, updated_at TEXT NOT NULL
+);
 INSERT OR IGNORE INTO store_settings(key,value) VALUES ('offset','0'),('paused','false');
 PRAGMA user_version=1;
 """
@@ -1009,6 +1012,25 @@ class Store:
     def offset(self) -> int:
         return int(self._one("SELECT value FROM store_settings WHERE key='offset'")["value"])
 
+    def record_chat_tail(self, chat_id: int, message_id: int) -> None:
+        """Запомнить последнее известное сообщение чата, чтобы прогресс держался внизу."""
+        if not isinstance(chat_id, int) or not isinstance(message_id, int) or message_id <= 0:
+            return
+        with self.transaction():
+            row = self._one("SELECT last_message_id FROM chat_tails WHERE chat_id=?", (chat_id,))
+            if row is not None and row["last_message_id"] >= message_id:
+                return
+            self.db.execute(
+                "INSERT INTO chat_tails(chat_id,last_message_id,updated_at) VALUES (?,?,?) "
+                "ON CONFLICT(chat_id) DO UPDATE SET last_message_id=excluded.last_message_id, updated_at=excluded.updated_at",
+                (chat_id, message_id, _utc()),
+            )
+
+    def chat_tail(self, chat_id: int) -> int:
+        """Наибольший известный id сообщения чата: и своего, и присланного владельцем."""
+        row = self._one("SELECT last_message_id FROM chat_tails WHERE chat_id=?", (chat_id,))
+        return int(row["last_message_id"]) if row is not None else 0
+
     def process_update(self, update_id: int, mutator: Callable[[], Any]) -> bool:
         with self.transaction():
             if self._one("SELECT update_id FROM processed_updates WHERE update_id=?", (update_id,)):
@@ -1040,6 +1062,35 @@ class Store:
             raise StoreError("invalid_error_code")
         with self.transaction():
             self.db.execute("UPDATE outbox SET available_at=?,error_code=?,attempts=attempts+1 WHERE id=? AND status='pending'", (_utc(available_at), error_code, id))
+
+    def progress_actions(self, work_uuid: str) -> list[dict]:
+        """Действия прогресса одного задания в порядке постановки."""
+        return self._many(
+            "SELECT id,status,sent_at,attempts,payload,result FROM outbox WHERE kind='telegram' "
+            "AND json_extract(payload,'$.purpose')='progress' AND json_extract(payload,'$.work_uuid')=? ORDER BY id",
+            (work_uuid,),
+        )
+
+    def progress_message_id(self, work_uuid: str) -> int | None:
+        """Сообщение живого прогресса: последняя удачная отправка с известным id."""
+        message_id = None
+        for row in self.progress_actions(work_uuid):
+            payload = row["payload"]
+            result = row["result"] or {}
+            if payload.get("method") in ("send_message", "send_rich_message") and result.get("message_id"):
+                message_id = result["message_id"]
+        return message_id
+
+    def forget_progress_message(self, work_uuid: str, message_id: int, reason: str) -> None:
+        """Сообщения отчёта больше нет: не пытаться править его повторно."""
+        with self.transaction():
+            for row in self.progress_actions(work_uuid):
+                result = row["result"]
+                if row["status"] != "sent" or not result or result.get("message_id") != message_id:
+                    continue
+                result = {key: value for key, value in result.items() if key != "message_id"}
+                result["skipped"] = reason
+                self.db.execute("UPDATE outbox SET result=? WHERE id=?", (_json(result), row["id"]))
 
     def save_tariff_snapshot(self, snapshot: dict) -> str:
         document = _json(snapshot)

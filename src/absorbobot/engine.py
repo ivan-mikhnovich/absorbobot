@@ -21,6 +21,7 @@ from absorbobot.identity import work_title
 from absorbobot.intake import Intake
 from absorbobot.metrics import JournalIngestor, PhaseMetrics, aggregate_reports
 from absorbobot.pricing import Pricing
+from absorbobot.reporting import TERMINAL_STAGES, progress_line
 from absorbobot.sandbox import Sandbox, SandboxError
 from absorbobot.store import StoreError, TERMINAL_JOBS, utc_now
 
@@ -241,6 +242,7 @@ class Engine:
             if self.store.authorized(owner):
                 self._notice(owner, source, "engine.delivery_unavailable",
                              dedupe=f"delivery-unavailable:{item['id']}")
+                self._drop_progress(owner, source)
             self.store.outbox_sent(item["id"], {"unavailable": getattr(exc, "code", "artifact_missing")})
         else:
             self.store.outbox_sent(item["id"], result)
@@ -308,31 +310,24 @@ class Engine:
         user = self.store.get_user(owner)
         if not user or not self.store.authorized(owner):
             return
-        language = user["language"]
-        text = tr(language, "engine.progress", id=work_title(self.store, job), stage=tr(language, stage))
-        if detail:
-            completed, total, unit = detail.get("completed"), detail.get("total"), detail.get("unit")
-            if isinstance(completed, (int, float)) and not isinstance(completed, bool):
-                factor = 1000000 if unit == "bytes" else 1
-                precision = 1 if unit in ("bytes", "seconds") else 0
-                values = f"{completed / factor:.{precision}f}"
-                if isinstance(total, (int, float)) and not isinstance(total, bool) and total > 0:
-                    values += f" / {total / factor:.{precision}f}"
-                    values += f" ({min(100, completed / total * 100):.0f}%)"
-                text += "\n" + values + " " + tr(language, "progress.unit." + unit)
-        if not final:
-            text += "\n" + tr(language, "progress.elapsed", seconds=int(now - started))
+        if stage in TERMINAL_STAGES:
+            # Живой отчёт нужен только пока идёт работа: итог и причину присылают отдельно.
+            self._drop_progress(owner, job["id"])
+            self._progress.pop(job["id"], None)
+            return
+        markdown, text = progress_line(user["language"], stage, detail=detail,
+                                       elapsed=None if final else int(now - started))
         outbox_id = previous.get("outbox_id")
         sent = self.store.db.execute("SELECT result FROM outbox WHERE id=? AND status='sent'", (outbox_id,)).fetchone() if outbox_id else None
         message_id = json.loads(sent["result"] or "{}").get("message_id") if sent else None
         if message_id:
             self.store.add_outbox("telegram", {"owner_id": owner, "method": "edit_message_text",
-                "purpose": "progress", "work_uuid": job["id"],
-                "kwargs": {"chat_id": owner, "message_id": message_id, "text": text}})
+                "purpose": "progress", "work_uuid": job["id"], "text": text,
+                "kwargs": {"chat_id": owner, "message_id": message_id, "rich_message": {"markdown": markdown}}})
         elif not outbox_id:
-            outbox_id = self.store.add_outbox("telegram", {"owner_id": owner, "method": "send_message",
-                "purpose": "progress", "work_uuid": job["id"],
-                "kwargs": {"chat_id": owner, "text": text, "reply_parameters": {
+            outbox_id = self.store.add_outbox("telegram", {"owner_id": owner, "method": "send_rich_message",
+                "purpose": "progress", "work_uuid": job["id"], "text": text,
+                "kwargs": {"chat_id": owner, "rich_message": {"markdown": markdown}, "reply_parameters": {
                     "message_id": job["source_message_id"], "allow_sending_without_reply": True}}})
         else:
             with self.store.transaction():
@@ -346,12 +341,34 @@ class Engine:
                             or payload.get("work_uuid") != job["id"]
                             or payload.get("purpose") != "progress"):
                         raise StoreError("progress_conflict")
-                    payload["kwargs"]["text"] = text
+                    payload["kwargs"]["rich_message"] = {"markdown": markdown}
+                    payload["text"] = text
                     self.store.db.execute(
                         "UPDATE outbox SET payload=? WHERE id=? AND status='pending'",
                         (json.dumps(payload, ensure_ascii=False, allow_nan=False), outbox_id),
                     )
         self._progress[job["id"]] = {**previous, "last": now, "outbox_id": outbox_id, "pending": None}
+
+    def _drop_progress(self, owner: int, work_uuid: str) -> None:
+        """Убрать сообщение живого отчёта: в чате остаются результат и причина отказа."""
+        message_id = None
+        for row in self.store.progress_actions(work_uuid):
+            if row["status"] == "pending":
+                # Несделанная строка отчёта уже не нужна: работа закончилась.
+                self.store.outbox_sent(row["id"], {"skipped": "work_finished"})
+                continue
+            payload = row["payload"]
+            result = row["result"] or {}
+            if payload.get("method") in ("send_message", "send_rich_message") and result.get("message_id"):
+                message_id = result["message_id"]
+        if message_id is None:
+            return
+        # Убранное сообщение больше не цель для правок: следующая строка будет новой.
+        self.store.forget_progress_message(work_uuid, message_id, "report_removed")
+        self.store.add_outbox("telegram", {
+            "owner_id": owner, "method": "delete_message",
+            "kwargs": {"chat_id": owner, "message_id": message_id},
+        }, dedupe_key=f"progress-drop:{work_uuid}:{message_id}")
 
     def _journal(self, job, ingestor, path, metrics, *, final=False):
         events = ingestor.read(path, final=final)

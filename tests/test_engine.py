@@ -1,5 +1,6 @@
 import asyncio
 from copy import deepcopy
+import json
 import sys
 
 import pytest
@@ -222,11 +223,57 @@ def test_engine_adds_input_preparation_and_persists_full_phase_reports(state, mo
     assert reports[1]['shared_device_observations'][0]['gpu_utilization'] == 70
 
 
+def test_live_report_is_rich_and_removed_when_work_finishes(state):
+    """Живой отчёт одной строкой, а по завершении его убирают вместе с несделанной правкой."""
+    store, engine, _ = state
+    draft = store.create_draft(2, source_message_id=123)
+    engine._progress_action(draft, "input.external",
+                            detail={"completed": 13_700_000, "total": 51_000_000, "unit": "bytes"})
+    actions = [row for row in store.pending_outbox(100)
+               if row["payload"].get("purpose") == "progress"]
+    assert len(actions) == 1
+    payload = actions[0]["payload"]
+    assert payload["method"] == "send_rich_message"
+    markdown = payload["kwargs"]["rich_message"]["markdown"]
+    assert "tg://emoji?id=6096080291347042802" in markdown
+    assert "`▮▮▮▯▯▯▯▯▯▯▯▯`" in markdown and "27 %" in markdown and "13.7 / 51.0 MB" in markdown
+    assert payload["text"].startswith("📥 Fetching the file · ▮▮▮▯")
+
+    store.outbox_sent(actions[0]["id"], {"message_id": 900, "progress": True})
+    engine._progress_action(draft, "input.ready", final=True)
+    rows = [row["payload"] for row in store.pending_outbox(100)]
+    drops = [row for row in rows if row.get("method") == "delete_message"]
+    assert [row["kwargs"]["message_id"] for row in drops] == [900]
+    stored = dict(store.db.execute("SELECT status,result FROM outbox WHERE id=?", (actions[0]["id"],)).fetchone())
+    assert stored["status"] == "sent"
+    # Отправленная строка остаётся историей, но целью правок быть перестаёт.
+    assert json.loads(stored["result"]) == {"progress": True, "skipped": "report_removed"}
+    assert store.progress_message_id(draft["id"]) is None
+
+
+def test_live_report_rewrites_the_pending_action(state):
+    """Частые правки одного состояния не плодят сообщений: продюсер правит уже поставленную строку."""
+    store, engine, _ = state
+    draft = store.create_draft(2, source_message_id=123)
+    engine._progress_action(draft, "stage.stt",
+                            detail={"completed": 100.0, "total": 400.0, "unit": "seconds"})
+    # Продюсер правит ту же строку не чаще раза в пять секунд: сдвинуть собственный счётчик.
+    engine._progress[draft["id"]]["last"] -= 10
+    engine._progress_action(draft, "stage.stt",
+                            detail={"completed": 300.0, "total": 400.0, "unit": "seconds"})
+    actions = [row for row in store.pending_outbox(100)
+               if row["payload"].get("purpose") == "progress"]
+    assert len(actions) == 1
+    markdown = actions[0]["payload"]["kwargs"]["rich_message"]["markdown"]
+    assert "75 %" in markdown and "`▮▮▮▮▮▮▮▮▮▯▯▯`" in markdown
+    assert "300.0 / 400.0 s of recording" in markdown
+
+
 def test_pending_intake_of_collecting_draft_gets_queued_stage(state):
     """Ожидающий импорт другой лекции показывает стадию ожидания.
 
-    Ключ подписи этой стадии берётся из каталога: прежде пропущенный
-    `input.queued` ронял службу в цикл перезапусков.
+    Подпись стадии и её знак обязаны быть в каталоге и в отчёте: прежде
+    пропущенный `input.queued` ронял службу в цикл перезапусков.
     """
     store, engine, _ = state
     draft = store.create_draft(2, source_message_id=123)
@@ -236,17 +283,24 @@ def test_pending_intake_of_collecting_draft_gets_queued_stage(state):
     store.set_paused(1, True)
     stop = asyncio.Event()
 
+    def progress_actions():
+        return [row for row in store.pending_outbox(limit=50)
+                if row["kind"] == "telegram" and row["payload"].get("purpose") == "progress"]
+
     async def scenario():
         task = asyncio.create_task(engine.run(stop))
         for _ in range(50):
             await asyncio.sleep(0.05)
-            if any("Waiting for the download to start" in str(row["payload"])
-                   for row in store.pending_outbox(limit=50)):
+            if progress_actions():
                 break
         stop.set()
         await task
 
     asyncio.run(scenario())
-    texts = [row["payload"].get("kwargs", {}).get("text", "")
-             for row in store.pending_outbox(limit=50) if row["kind"] == "telegram"]
-    assert any("Waiting for the download to start" in text for text in texts)
+    actions = progress_actions()
+    assert actions, "ожидающая стадия обязана попасть в живой отчёт"
+    payload = actions[0]["payload"]
+    assert payload["method"] == "send_rich_message"
+    markdown = payload["kwargs"]["rich_message"]["markdown"]
+    assert "tg://emoji?id=6096080291347042802" in markdown and "Fetching the file" in markdown
+    assert payload["text"].startswith("📥 Fetching the file")

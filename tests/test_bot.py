@@ -3,7 +3,7 @@ import json
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
-from aiogram.exceptions import TelegramRetryAfter
+from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
 from aiogram.types import Update
 import pytest
 
@@ -153,8 +153,18 @@ class FakeBot:
     async def send_message(self, **kwargs):
         return self._record("send_message", kwargs)
 
+    async def send_rich_message(self, **kwargs):
+        return self._record("send_rich_message", kwargs)
+
     async def edit_message_text(self, **kwargs):
         return self._record("edit_message_text", kwargs)
+
+    async def delete_message(self, **kwargs):
+        if self.fail is not None:
+            failure, self.fail = self.fail, None
+            raise failure
+        self.calls.append(("delete_message", kwargs))
+        return True
 
     async def send_media_group(self, **kwargs):
         if self.fail is not None:
@@ -209,17 +219,22 @@ def make_job(store, owner=2, signature="same"):
     return store.enqueue(owner, draft["id"], NOW, force_new=False)
 
 
-def progress_row(store, job, text, *, method="send_message", owner=None, message_id=None):
+def progress_row(store, job, text, *, method="send_rich_message", owner=None, message_id=None):
+    """Действие живого отчёта: богатая разметка и её текстовый запасной вид."""
     owner = job["owner_id"] if owner is None else owner
-    kwargs = {"chat_id": owner, "text": text}
-    if method == "send_message":
+    kwargs = {"chat_id": owner, "rich_message": {"markdown": f"**{text}**"}}
+    if method == "send_rich_message":
         kwargs["reply_parameters"] = {"message_id": job["source_message_id"],
                                       "allow_sending_without_reply": True}
     else:
         kwargs["message_id"] = message_id
-    return store.add_outbox("telegram", {"owner_id": owner, "method": method,
+    return store.add_outbox("telegram", {"owner_id": owner, "method": method, "text": text,
                                          "purpose": "progress", "work_uuid": job["id"],
                                          "kwargs": kwargs})
+
+
+def progress_markdown(call):
+    return call[1]["rich_message"]["markdown"]
 
 
 def outbox_row(store, item_id):
@@ -234,7 +249,8 @@ def rewrite_text(store, item_id, text):
     """Изменить текст ещё не отправленного действия так же, как это делает продюсер."""
     payload = outbox_row(store, item_id)["payload"]
     payload = json.loads(payload)
-    payload["kwargs"]["text"] = text
+    payload["text"] = text
+    payload["kwargs"]["rich_message"] = {"markdown": f"**{text}**"}
     store.db.execute("UPDATE outbox SET payload=? WHERE id=?",
                      (json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
                       item_id))
@@ -256,8 +272,8 @@ def test_progress_initial_send_reads_fresh_text_and_stays_singular(tmp_path, clo
         bot = FakeBot()
         outbox = TelegramOutbox(bot, store)
         asyncio.run(outbox.send(snapshot))
-        assert [call[0] for call in bot.calls] == ["send_message"]
-        assert bot.calls[0][1]["text"] == "Job X\nstatus.completed"
+        assert [call[0] for call in bot.calls] == ["send_rich_message"]
+        assert progress_markdown(bot.calls[0]) == "**Job X\nstatus.completed**"
         assert bot.calls[0][1]["reply_parameters"]["message_id"] == job["source_message_id"]
         result = outbox_result(store, root)
         assert result["progress"] is True and result["message_id"]
@@ -266,9 +282,9 @@ def test_progress_initial_send_reads_fresh_text_and_stays_singular(tmp_path, clo
         duplicate = progress_row(store, job, "Job X\nstatus.failed")
         clock["now"] = NOW + timedelta(seconds=6)
         dispatch(store, outbox, duplicate)
-        assert [call[0] for call in bot.calls] == ["send_message", "edit_message_text"]
+        assert [call[0] for call in bot.calls] == ["send_rich_message", "edit_message_text"]
         assert bot.calls[1][1]["message_id"] == result["message_id"]
-        assert bot.calls[1][1]["text"] == "Job X\nstatus.failed"
+        assert progress_markdown(bot.calls[1]) == "**Job X\nstatus.failed**"
         assert outbox_result(store, duplicate)["progress"] is True
 
 
@@ -289,8 +305,8 @@ def test_progress_backlog_coalesces_to_newest_edit(tmp_path, clock):
         clock["now"] = NOW + timedelta(seconds=6)
         for item in store.pending_outbox(100):
             asyncio.run(outbox.send(item))
-        assert [call[0] for call in bot.calls] == ["send_message", "edit_message_text"]
-        assert bot.calls[1][1]["text"] == "Job X\nstage.two"
+        assert [call[0] for call in bot.calls] == ["send_rich_message", "edit_message_text"]
+        assert progress_markdown(bot.calls[1]) == "**Job X\nstage.two**"
         assert outbox_result(store, older) == {"skipped": "superseded", "superseded_by": newer}
         assert outbox_result(store, newer)["progress"] is True
         assert outbox_row(store, older)["status"] == "sent"
@@ -309,7 +325,7 @@ def test_progress_spacing_survives_restart_without_spending_attempts(tmp_path, c
                             message_id=message_id)
         clock["now"] = NOW + timedelta(seconds=1)
         dispatch(store, TelegramOutbox(bot, store), edit)
-        assert [call[0] for call in bot.calls] == ["send_message"]
+        assert [call[0] for call in bot.calls] == ["send_rich_message"]
         deferred = outbox_row(store, edit)
         assert deferred["status"] == "pending" and deferred["attempts"] == 0
         assert datetime.fromisoformat(deferred["available_at"]) == NOW + timedelta(seconds=5)
@@ -319,8 +335,8 @@ def test_progress_spacing_survives_restart_without_spending_attempts(tmp_path, c
         clock["now"] = NOW + timedelta(seconds=5)
         assert [row["id"] for row in restarted.pending_outbox(100)] == [edit]
         dispatch(restarted, TelegramOutbox(bot, restarted), edit)
-    assert [call[0] for call in bot.calls] == ["send_message", "edit_message_text"]
-    assert bot.calls[1][1]["text"] == "Job X\nstage.two"
+    assert [call[0] for call in bot.calls] == ["send_rich_message", "edit_message_text"]
+    assert progress_markdown(bot.calls[1]) == "**Job X\nstage.two**"
 
 
 def test_progress_retry_after_is_never_shortened_by_spacing(tmp_path, clock):
@@ -337,7 +353,7 @@ def test_progress_retry_after_is_never_shortened_by_spacing(tmp_path, clock):
         clock["now"] = NOW + timedelta(seconds=6)
         bot.fail = TelegramRetryAfter(SimpleNamespace(chat_id=2), "flood control", 30)
         dispatch(store, TelegramOutbox(bot, store), edit)
-        assert [call[0] for call in bot.calls] == ["send_message"]
+        assert [call[0] for call in bot.calls] == ["send_rich_message"]
         deferred = outbox_row(store, edit)
         assert deferred["error_code"] == "telegram_rate_limit" and deferred["attempts"] == 1
         assert datetime.fromisoformat(deferred["available_at"]) == NOW + timedelta(seconds=36)
@@ -345,7 +361,7 @@ def test_progress_retry_after_is_never_shortened_by_spacing(tmp_path, clock):
         assert not store.pending_outbox(100)
         clock["now"] = NOW + timedelta(seconds=36)
         dispatch(store, TelegramOutbox(bot, store), edit)
-    assert [call[0] for call in bot.calls] == ["send_message", "edit_message_text"]
+    assert [call[0] for call in bot.calls] == ["send_rich_message", "edit_message_text"]
 
 
 def test_progress_rejects_foreign_owner_and_revoked_access(tmp_path, clock):
@@ -382,11 +398,97 @@ def test_non_progress_notices_are_neither_gated_nor_coalesced(tmp_path, clock):
                    for index in range(2)]
         for item in store.pending_outbox(100):
             asyncio.run(outbox.send(item))
-        assert [call[0] for call in bot.calls] == ["send_message"] * 3
+        assert [call[0] for call in bot.calls] == ["send_rich_message", "send_message", "send_message"]
         assert [call[1]["text"] for call in bot.calls[1:]] == ["notice 0", "notice 1"]
         for item_id in notices:
             result = outbox_result(store, item_id)
             assert result.get("message_id") and "progress" not in result
+
+
+def test_progress_resends_when_it_is_no_longer_last(tmp_path, clock):
+    """Отчёт обязан быть последним сообщением чата: отставшее убирают и ставят заново."""
+    settings = make_settings(tmp_path)
+    with Store(settings) as store:
+        store.allow_user(1, 2)
+        job = make_job(store)
+        bot = FakeBot()
+        outbox = TelegramOutbox(bot, store)
+        root = progress_row(store, job, "Job X\nstatus.running")
+        dispatch(store, outbox, root)
+        stale = outbox_result(store, root)["message_id"]
+        # Владелец прислал новое сообщение: живой отчёт оказался выше него.
+        store.record_chat_tail(2, stale + 5)
+        edit = progress_row(store, job, "Job X\nstage.two", method="edit_message_text", message_id=stale)
+        clock["now"] = NOW + timedelta(seconds=6)
+        dispatch(store, outbox, edit)
+        assert [call[0] for call in bot.calls] == ["send_rich_message", "send_rich_message"]
+        assert bot.calls[1][1]["reply_parameters"]["message_id"] == job["source_message_id"]
+        drops = [row for row in store.pending_outbox(100)
+                 if row["payload"].get("method") == "delete_message"]
+        assert [row["payload"]["kwargs"]["message_id"] for row in drops] == [stale]
+        assert outbox_result(store, edit)["progress"] is True
+
+
+def test_missing_progress_message_is_sent_again(tmp_path, clock):
+    """Если сообщение отчёта исчезло, строка ставится заново, а не правится в пустоту."""
+    settings = make_settings(tmp_path)
+    with Store(settings) as store:
+        store.allow_user(1, 2)
+        job = make_job(store)
+        bot = FakeBot()
+        outbox = TelegramOutbox(bot, store)
+        root = progress_row(store, job, "Job X\nstatus.running")
+        dispatch(store, outbox, root)
+        stale = outbox_result(store, root)["message_id"]
+        edit = progress_row(store, job, "Job X\nstage.two", method="edit_message_text", message_id=stale)
+        clock["now"] = NOW + timedelta(seconds=6)
+        bot.fail = TelegramBadRequest(SimpleNamespace(chat_id=2), "message to edit not found")
+        dispatch(store, outbox, edit)
+        assert [call[0] for call in bot.calls] == ["send_rich_message"]
+        assert outbox_result(store, edit) == {"skipped": "rejected_TelegramBadRequest"}
+        # Исчезнувшее сообщение забыто: следующая строка отправляется заново.
+        assert store.progress_message_id(job["id"]) is None
+        again = [row for row in store.pending_outbox(100)
+                 if row["payload"].get("purpose") == "progress"
+                 and row["payload"]["method"] == "send_rich_message"]
+        assert len(again) == 1
+        dispatch(store, outbox, again[0]["id"])
+        assert [call[0] for call in bot.calls] == ["send_rich_message", "send_rich_message"]
+        assert store.progress_message_id(job["id"]) == outbox_result(store, again[0]["id"])["message_id"]
+
+
+def test_rejected_rich_message_falls_back_to_plain_text(tmp_path, clock):
+    """Отказ богатой разметки не теряет строку: её повторяют обычным текстом."""
+    settings = make_settings(tmp_path)
+    with Store(settings) as store:
+        store.allow_user(1, 2)
+        job = make_job(store)
+        bot = FakeBot()
+        outbox = TelegramOutbox(bot, store)
+        root = progress_row(store, job, "Job X\nstatus.running")
+        bot.fail = TelegramBadRequest(SimpleNamespace(chat_id=2), "rich messages are not supported")
+        dispatch(store, outbox, root)
+        assert not bot.calls
+        assert outbox_result(store, root) == {"skipped": "rich_rejected_TelegramBadRequest"}
+        plain = [row for row in store.pending_outbox(100)
+                 if row["payload"].get("purpose") == "progress" and row["payload"]["method"] == "send_message"]
+        assert len(plain) == 1
+        assert plain[0]["payload"]["kwargs"]["text"] == "Job X\nstatus.running"
+        dispatch(store, outbox, plain[0]["id"])
+        assert [call[0] for call in bot.calls] == ["send_message"]
+        assert bot.calls[0][1]["text"] == "Job X\nstatus.running"
+
+
+def test_incoming_message_moves_the_chat_tail(runtime):
+    """Присланное владельцем сообщение сдвигает конец чата, за которым следит отчёт."""
+    store, router = runtime
+    store.record_chat_tail(1, 50)
+    raw = update(51, 1, text="привет").model_dump(mode="json", by_alias=True, exclude_none=True)
+    router.handle(Update.model_validate(raw))
+    assert store.chat_tail(1) == 51
+    # Старое значение не понижает уже известный конец чата.
+    store.record_chat_tail(1, 7)
+    assert store.chat_tail(1) == 51
 
 
 def completed_job(store, owner=2):
