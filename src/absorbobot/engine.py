@@ -17,6 +17,7 @@ import yaml
 from absorbobot.config import ConfigError, check_storage, create_work_tree, probe_core
 from absorbobot.delivery import Delivery, package_result
 from absorbobot.i18n import tr
+from absorbobot.identity import work_title
 from absorbobot.intake import Intake
 from absorbobot.metrics import JournalIngestor, PhaseMetrics, aggregate_reports
 from absorbobot.pricing import Pricing
@@ -46,8 +47,9 @@ class Engine:
         user = self.store.get_user(owner)
         if user is None:
             return
+        work = self.store.get_job(work_uuid) or self.store.get_draft(work_uuid)
         payload = {"owner_id": owner, "method": "send_message", "kwargs": {
-            "chat_id": owner, "text": tr(user["language"], key, id=work_uuid, **values),
+            "chat_id": owner, "text": tr(user["language"], key, id=work_title(self.store, work, viewer=owner) if work else tr(user["language"], "work.lecture"), **values),
         }}
         if source:
             payload["kwargs"]["reply_parameters"] = {
@@ -126,7 +128,15 @@ class Engine:
         try:
             while not stop.is_set() and not self._stopping:
                 self.delivery.reconcile()
+                self._delivery_progress()
                 actions = self._domain_outbox()
+                for queued in self.store.jobs(statuses=["queued"], limit=1000):
+                    self._progress_action(queued, "status.queued")
+                for item in actions:
+                    if item["kind"] == "intake" and item["payload"]["draft_id"] != self._active_uuid:
+                        draft = self.store.get_draft(item["payload"]["draft_id"])
+                        if draft and not draft["close_requested"] and draft["status"] in ("collecting", "ready"):
+                            self._progress_action(draft, "input.queued")
                 for item in actions:
                     if item["kind"] == "cancel_work":
                         await self._cancel(item["payload"])
@@ -164,7 +174,21 @@ class Engine:
 
     async def _import(self, item):
         try:
-            result = await self.intake.handle(item["payload"])
+            payload = item["payload"]
+            task = asyncio.create_task(self.intake.handle(payload))
+            try:
+                while not task.done():
+                    draft = self.store.get_draft(payload["draft_id"], payload["owner_id"])
+                    feedback = (draft or {}).get("ui_state", {}).get("import_progress")
+                    if draft and feedback:
+                        self._progress_action(draft, "input." + feedback["stage"], detail=feedback)
+                    await asyncio.sleep(0.25)
+                result = await task
+            except BaseException:
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+                raise
         except StoreError as exc:
             if exc.code not in ("paused", "execution_busy"):
                 raise
@@ -173,7 +197,34 @@ class Engine:
             self.store.outbox_sent(item["id"], {"interrupted": True})
             raise
         else:
+            payload = item["payload"]
+            self.dialog.import_finished(payload["owner_id"], payload["draft_id"], result,
+                                        payload["message"]["message_id"])
+            draft = self.store.get_draft(payload["draft_id"], payload["owner_id"])
+            if draft:
+                stage = "input.ready" if result.get("status") == "imported" else "input.failed"
+                self._progress_action(draft, stage, final=True)
             self.store.outbox_sent(item["id"], result)
+
+    def _delivery_progress(self):
+        for row in self.store.db.execute("SELECT * FROM deliveries WHERE status IN ('pending','sent')").fetchall():
+            metrics = json.loads(row["metrics"])
+            if "documents" not in metrics or metrics.get("feedback_completed"):
+                continue
+            work = self.store.get_draft(row["work_uuid"]) if row["work_uuid"] else None
+            work = work or self.store.get_job(row["source_job_id"])
+            if not work or work["owner_id"] != row["owner_id"]:
+                continue
+            actions = self.store.db.execute(
+                "SELECT status,result FROM outbox WHERE dedupe_key LIKE ?", (f"delivery:{row['id']}:%",)
+            ).fetchall()
+            completed = sum(action["status"] == "sent" and not json.loads(action["result"] or "{}").get("skipped") for action in actions)
+            final = row["status"] == "sent"
+            self._progress_action(work, "status.delivered" if final else "stage.delivery",
+                                  detail={"completed": completed, "total": len(actions), "unit": "items"}, final=final)
+            if final:
+                metrics["feedback_completed"] = True
+                self.store.db.execute("UPDATE deliveries SET metrics=? WHERE id=?", (json.dumps(metrics), row["id"]))
 
     async def _deliver(self, item):
         try:
@@ -239,18 +290,33 @@ class Engine:
                 argv += ["--slides", "/work/" + file["relative_path"]]
         return argv
 
-    def _progress_action(self, job, stage, *, final=False):
+    def _progress_action(self, job, stage, *, final=False, detail=None):
         now = time.monotonic()
         previous = self._progress.get(job["id"], {})
+        changed = stage != previous.get("stage")
+        started = now if changed else previous.get("started", now)
+        self._progress[job["id"]] = previous = {**previous, "stage": stage, "started": started,
+                                               "detail": detail, "pending": stage}
         if not final and now - previous.get("last", -10) < 5:
-            previous["pending"] = stage
             return
         owner = job["owner_id"]
         user = self.store.get_user(owner)
         if not user or not self.store.authorized(owner):
             return
-        text = tr(user["language"], "engine.progress", id=job["id"],
-                  stage=tr(user["language"], stage))
+        language = user["language"]
+        text = tr(language, "engine.progress", id=work_title(self.store, job), stage=tr(language, stage))
+        if detail:
+            completed, total, unit = detail.get("completed"), detail.get("total"), detail.get("unit")
+            if isinstance(completed, (int, float)) and not isinstance(completed, bool):
+                factor = 1000000 if unit == "bytes" else 1
+                precision = 1 if unit in ("bytes", "seconds") else 0
+                values = f"{completed / factor:.{precision}f}"
+                if isinstance(total, (int, float)) and not isinstance(total, bool) and total > 0:
+                    values += f" / {total / factor:.{precision}f}"
+                    values += f" ({min(100, completed / total * 100):.0f}%)"
+                text += "\n" + values + " " + tr(language, "progress.unit." + unit)
+        if not final:
+            text += "\n" + tr(language, "progress.elapsed", seconds=int(now - started))
         outbox_id = previous.get("outbox_id")
         sent = self.store.db.execute("SELECT result FROM outbox WHERE id=? AND status='sent'", (outbox_id,)).fetchone() if outbox_id else None
         message_id = json.loads(sent["result"] or "{}").get("message_id") if sent else None
@@ -280,7 +346,7 @@ class Engine:
                         "UPDATE outbox SET payload=? WHERE id=? AND status='pending'",
                         (json.dumps(payload, ensure_ascii=False, allow_nan=False), outbox_id),
                     )
-        self._progress[job["id"]] = {"last": now, "outbox_id": outbox_id, "pending": None}
+        self._progress[job["id"]] = {**previous, "last": now, "outbox_id": outbox_id, "pending": None}
 
     def _journal(self, job, ingestor, path, metrics, *, final=False):
         events = ingestor.read(path, final=final)
@@ -322,12 +388,14 @@ class Engine:
                     while not task.done():
                         events = self._journal(job, ingestor, tree / "events.jsonl", metrics)
                         for event in events:
-                            stage = event.get("stage")
-                            if event.get("event") == "stage_start" and stage:
+                            stage, event_name = event.get("stage"), event.get("event")
+                            if event_name == "stage_start" and stage:
                                 self._progress_action(job, "stage." + stage)
-                        pending = self._progress.get(job["id"], {}).get("pending")
-                        if pending:
-                            self._progress_action(job, pending)
+                            elif event_name == "stage_progress" and stage:
+                                self._progress_action(job, "stage." + stage, detail=event)
+                        previous = self._progress.get(job["id"], {})
+                        if previous.get("stage"):
+                            self._progress_action(job, previous["stage"], detail=previous.get("detail"))
                         await asyncio.sleep(0.25)
                     result = await task
                 except BaseException:
@@ -389,8 +457,12 @@ class Engine:
                     "/workers/render.py", "/work/output/notes.md", job["snapshot"]["settings"]["output_language"]]
             await self._phase(job, "render", argv, core, ingestor, reports, metrics, deadline, network=False)
             metrics["render_seconds"] = time.monotonic() - rendering
+            self._progress_action(job, "stage.package")
             packaging = asyncio.create_task(asyncio.to_thread(package_result, tree))
             try:
+                while not packaging.done():
+                    self._progress_action(job, "stage.package")
+                    await asyncio.sleep(0.25)
                 await asyncio.shield(packaging)
             except asyncio.CancelledError:
                 await asyncio.shield(packaging)

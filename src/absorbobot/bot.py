@@ -106,7 +106,7 @@ class TelegramOutbox:
     async def _send_progress(self, item: dict, payload: dict) -> None:
         item_id, owner = item["id"], payload["owner_id"]
         work_uuid = payload["work_uuid"]
-        job = self.store.get_job(work_uuid)
+        job = self.store.get_job(work_uuid) or self.store.get_draft(work_uuid)
         if not job or job["owner_id"] != owner:
             # Прогресс не должен уходить чужому владельцу или несуществующему заданию.
             self.store.outbox_sent(item_id, {"skipped": "owner_mismatch"})
@@ -166,6 +166,21 @@ class TelegramOutbox:
             raise ValueError("Outbox recipient does not match owner.")
         if kwargs.get("photo") == "asset:absorbent.jpg":
             kwargs["photo"] = FSInputFile(Path(__file__).with_name("assets") / "absorbent.jpg")
+        if method == "send_photo" and "preview" in payload:
+            work = self.store.get_draft(payload["work_uuid"]) or self.store.get_job(payload["work_uuid"])
+            if not work or work["owner_id"] != owner or work.get("files_deleted"):
+                self.store.outbox_sent(item["id"], {"skipped": "source_unavailable"})
+                return
+            base = (self.store.settings.storage_dir / "jobs").resolve()
+            root = base / work["id"]
+            source = root / payload["preview"]
+            path = source.resolve()
+            if (root.is_symlink() or source.is_symlink() or not root.resolve().is_relative_to(base)
+                    or not path.is_relative_to(root) or path.suffix.lower() != ".jpg"
+                    or not path.is_file() or path.stat().st_size > 262144):
+                self.store.outbox_sent(item["id"], {"skipped": "preview_unavailable"})
+                return
+            kwargs["photo"] = FSInputFile(path)
         if method == "send_document" and "file" in payload:
             # Только заранее подготовленный собственный файл, не произвольный путь update.
             source = self.store.get_job(payload["work_uuid"])

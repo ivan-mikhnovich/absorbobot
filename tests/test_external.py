@@ -314,6 +314,15 @@ def test_fetch_rejects_html_page_masquerading_as_pdf(tmp_path):
     assert str(error.value) == "unsupported_input"
 
 
+def test_fetch_records_byte_progress(tmp_path):
+    from absorbobot.workers.progress import read_progress
+    routes = {CANONICAL_DIRECT: [_Response([b"payload"], {"Content-Type": "application/pdf"})]}
+    result, _ = run(request(), routes, tmp_path)
+    assert result["ok"] is True and result["bytes"] == 7
+    assert read_progress(tmp_path, "external", "bytes") == {
+        "completed": 7, "total": 7, "unit": "bytes"}
+
+
 def test_fetch_cleans_partial_tree_on_failure(tmp_path):
     value = request(url="https://files.example.org/clip.mp4", max_media_bytes=8)
     routes = {"https://files.example.org/clip.mp4": [

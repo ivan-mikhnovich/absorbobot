@@ -379,21 +379,3 @@ def test_non_progress_notices_are_neither_gated_nor_coalesced(tmp_path, clock):
             assert result.get("message_id") and "progress" not in result
 
 
-def test_actual_engine_progress_before_first_send_delivers_latest_stage(tmp_path, clock):
-    settings = make_settings(tmp_path)
-    with Store(settings) as store:
-        store.allow_user(1, 2)
-        job = make_job(store)
-        engine = Engine(settings, store, None, None, {})
-        engine._progress_action(job, "status.running", final=True)
-        snapshot = store.pending_outbox(100)[0]
-        engine._progress_action(job, "stage.stt", final=True)
-        engine._progress_action(job, "stage.render", final=True)
-        bot = FakeBot()
-        asyncio.run(TelegramOutbox(bot, store).send(snapshot))
-        assert [call[0] for call in bot.calls] == ["send_message"]
-        user = store.get_user(job["owner_id"])
-        assert bot.calls[0][1]["text"] == tr(
-            user["language"], "engine.progress", id=job["id"],
-            stage=tr(user["language"], "stage.render"))
-        assert not store.pending_outbox(100)

@@ -10,6 +10,7 @@ import math
 from pathlib import PurePath
 
 from .i18n import tr
+from .identity import work_title, work_preview
 from .store import StoreError, QuotaError
 from .workers.youtube import YouTubeError, normalize_youtube_url
 from .workers.external import normalize_external_url
@@ -100,7 +101,7 @@ class Dialog:
         if target == 'user':
             return None
         draft = self.store.get_draft(target, owner)
-        if not draft or draft['status'] not in ('collecting', 'ready') or draft['close_requested']:
+        if not draft or draft['status'] not in ('collecting', 'preparing', 'ready') or draft['close_requested']:
             raise StoreError('draft_consumed')
         return draft
 
@@ -128,6 +129,14 @@ class Dialog:
                 raise StoreError('model_missing', category=category, model=name)
             models[category] = {'name': name, **deepcopy(self.core['models'][category][name])}
         return models
+
+    def _preview(self, owner, draft):
+        relative = work_preview(draft)
+        if relative:
+            self.store.add_outbox('telegram', {
+                'owner_id': owner, 'method': 'send_photo', 'work_uuid': draft['id'],
+                'preview': relative, 'kwargs': {'chat_id': owner, 'caption': work_title(self.store, draft)},
+            }, dedupe_key=f"preview:{draft['id']}:{relative}")
 
     def _main_settings(self, owner, draft=None, advanced=False):
         target = draft['id'] if draft else 'user'
@@ -171,8 +180,8 @@ class Dialog:
         user = self.store.get_user(owner)
         selected = {key: value for key, value in user['settings'].items() if key != '_dialog'}
         selected['output_language_override'] = user.get('output_language_override')
-        draft = self.store.create_draft(owner, settings=selected)
-        self._send(owner, tr(self._language(owner), 'dialog.send_source', id=draft['id']))
+        self.store.create_draft(owner, settings=selected)
+        self._send(owner, tr(self._language(owner), 'dialog.send_source'))
 
     def _source(self, message):
         result = {'message_id': message.get('message_id'), 'chat': {'id': message['chat']['id']}}
@@ -190,7 +199,7 @@ class Dialog:
         if not draft:
             self._send(owner, tr(self._language(owner), 'dialog.need_new'), self._menu(owner))
             return
-        if draft['status'] == 'preparing' or draft['close_requested']:
+        if draft['close_requested']:
             self._send(owner, tr(self._language(owner), 'dialog.preparing'))
             return
         youtube, external = False, False
@@ -242,6 +251,66 @@ class Dialog:
         self.store.add_outbox('intake', {'owner_id': owner, 'draft_id': draft_id, 'message': source})
         self._send(owner, tr(self._language(owner), 'dialog.add_materials'), [[self._button(owner, 'button.files_added', 'files_added', draft_id)]])
 
+    def _files_added(self, owner, draft_id):
+        draft = self.store.get_draft(draft_id, owner)
+        if not draft or draft['status'] not in ('collecting', 'preparing', 'ready') or draft['close_requested']:
+            job = self.store.get_job(draft_id, owner)
+            if job:
+                self._send(owner, tr(self._language(owner), 'dialog.action_recorded', status=tr(self._language(owner), 'status.' + job['status'])))
+                self._jobs(owner)
+                return
+            raise StoreError('draft_consumed')
+        state = dict(draft['ui_state'])
+        if state.get('pending_import_ids') or draft['status'] == 'preparing':
+            state['finish_requested'] = True
+            self.store.update_draft(owner, draft_id, ui_state=state)
+            self._send(owner, tr(self._language(owner), 'dialog.finish_waiting'))
+            return
+        state.pop('finish_requested', None)
+        self.store.update_draft(owner, draft_id, ui_state=state)
+        self._summary(owner, draft_id)
+
+    def import_finished(self, owner, draft_id, result, message_id):
+        """Продолжить подтверждённый приём только после завершения всех импортов."""
+        if not self.store.authorized(owner):
+            return
+        draft = self.store.get_draft(draft_id, owner)
+        if not draft or draft['status'] not in ('collecting', 'ready') or draft['close_requested']:
+            return
+        state = draft['ui_state']
+        if result.get('status') == 'imported':
+            self._preview(owner, draft)
+        if state.get('finish_requested') and not state.get('pending_import_ids'):
+            try:
+                self._files_added(owner, draft_id)
+            except StoreError as exc:
+                self._error(owner, exc)
+        elif result.get('status') == 'imported':
+            self._send(owner, tr(self._language(owner), 'dialog.input_ready'),
+                       [[self._button(owner, 'button.files_added', 'files_added', draft_id)]],
+                       reply=message_id)
+
+    def _repeat_callback(self, owner, record):
+        action, target = record['action'], record['target']
+        if action in ('nav', 'history', 'files_added', 'summary'):
+            self._callback(owner, record)
+            return
+        draft = self.store.get_draft(target, owner)
+        if draft and draft['status'] in ('collecting', 'preparing', 'ready') and not draft['close_requested']:
+            if draft['ui_state'].get('pending_import_ids') or draft['status'] == 'preparing':
+                self._send(owner, tr(self._language(owner), 'dialog.import_waiting'),
+                           [[self._button(owner, 'button.files_added', 'files_added', target)]])
+            else:
+                self._main_settings(owner, draft)
+            return
+        job = self.store.get_job(target, owner)
+        if job:
+            self._send(owner, tr(self._language(owner), 'dialog.action_recorded',
+                                status=tr(self._language(owner), 'status.' + job['status'])))
+            self._jobs(owner)
+        else:
+            self._main_settings(owner)
+
     def _prepare(self, owner, draft_id):
         draft = self._target(owner, draft_id)
         files = [f for f in self.store.files(draft_id) if not f['removed']]
@@ -256,6 +325,7 @@ class Dialog:
         from .intake import input_signature
         signature = input_signature(files, chosen, models)
         snapshot = {**chosen, 'settings': chosen, 'models': models, 'version_info': deepcopy(self.core['version_info']), 'source_message_id': draft['source_message_id'], 'source_chat_id': draft['source_chat_id']}
+        snapshot.update(source_title=work_title(self.store, draft), source_preview=work_preview(draft))
         draft = self.store.update_draft(owner, draft_id, status='ready', settings={**draft['settings'], **chosen}, input_signature=signature, snapshot=snapshot)
         fingerprint = _digest({'signature': signature, 'snapshot': snapshot})
         return draft, files, chosen, models, fingerprint
@@ -263,7 +333,8 @@ class Dialog:
     def _summary(self, owner, draft_id):
         draft, files, chosen, models, fingerprint = self._prepare(owner, draft_id)
         lang = self._language(owner)
-        lines = [tr(lang, 'dialog.summary', id=draft_id)]
+        self._preview(owner, draft)
+        lines = [tr(lang, 'dialog.summary', id=work_title(self.store, draft))]
         for file in files:
             lines.append(tr(lang, 'dialog.file', name=file['original_name'], bytes=file['bytes'], duration=file['duration'] if file['duration'] is not None else tr(lang, 'unknown'), pages=file['pages'] if file['pages'] is not None else tr(lang, 'unknown')))
         for key in ('language', 'output_language', *NUMBERS, 'youtube_mode'):
@@ -289,7 +360,7 @@ class Dialog:
             raise StoreError('invalid_number')
 
     def _accepted(self, owner, job):
-        self._send(owner, tr(self._language(owner), 'dialog.accepted', id=job['id'], position=self.store.queue_position(job['id'])))
+        self._send(owner, tr(self._language(owner), 'dialog.accepted', id=work_title(self.store, job), position=self.store.queue_position(job['id'])))
 
     def _reuse_rows(self, owner, target, source, fingerprint=None, late=False):
         payload = {'source_job_id': source['id']}
@@ -327,18 +398,22 @@ class Dialog:
         lines = [tr(lang, 'dialog.jobs')]
         rows = []
         for job in jobs:
-            lines.append(f'{job["id"]} — {tr(lang, "status." + job["status"])}; {job["accepted_at"]}')
+            title = work_title(self.store, job)
+            lines.append(f'{title} — {tr(lang, "status." + job["status"])}; {job["accepted_at"]}')
             if job['status'] == 'awaiting_reuse_choice':
                 try:
                     rows.extend(self.late_reuse_buttons(owner, job['id'])['inline_keyboard'])
                 except StoreError:
                     rows.append([self._button(owner, 'button.force_new', 'late_force', job['id'])])
             if job['status'] == 'completed' and not job['files_deleted']:
-                rows.append([self._button(owner, tr(lang, 'dialog.redeliver', id=job['id']), 'redeliver', job['id'], {'kind': 'job'}, literal=True)])
+                rows.append([self._button(owner, tr(lang, 'dialog.redeliver', id=title), 'redeliver', job['id'], {'kind': 'job'}, literal=True)])
         for delivery in deliveries:
-            lines.append(tr(lang, 'dialog.history_delivery', id=delivery['work_uuid'] or str(delivery['id']), status=tr(lang, 'dialog.files_deleted' if delivery['files_deleted'] else 'dialog.result_available')))
+            work = self.store.get_draft(delivery['work_uuid'], owner) if delivery['work_uuid'] else None
+            source = work or self.store.get_job(delivery['source_job_id'])
+            title = work_title(self.store, source, viewer=owner) if source else tr(lang, 'work.cached_result')
+            lines.append(tr(lang, 'dialog.history_delivery', id=title, status=tr(lang, 'dialog.files_deleted' if delivery['files_deleted'] else 'dialog.result_available')))
             if not delivery['files_deleted']:
-                rows.append([self._button(owner, tr(lang, 'dialog.redeliver', id=delivery['work_uuid'] or str(delivery['id'])), 'redeliver', str(delivery['id']), {'kind': 'delivery'}, literal=True)])
+                rows.append([self._button(owner, tr(lang, 'dialog.redeliver', id=title), 'redeliver', str(delivery['id']), {'kind': 'delivery'}, literal=True)])
         nav = []
         if offset:
             nav.append(self._button(owner, 'button.previous', 'history', payload={'offset': max(0, offset - 10)}))
@@ -377,7 +452,7 @@ class Dialog:
             if job['status'] == 'cancel_requested':
                 self._cancel_work(owner, job['id'], 'user')
             else:
-                self._send(owner, tr(self._language(owner), 'dialog.cancelled', id=job['id']), reply=job['source_message_id'], purpose='cancellation')
+                self._send(owner, tr(self._language(owner), 'dialog.cancelled', id=work_title(self.store, job)), reply=job['source_message_id'], purpose='cancellation')
         if payload.get('draft_id'):
             draft = self.store.get_draft(payload['draft_id'], owner)
             if draft and draft['status'] in ('collecting', 'preparing', 'ready'):
@@ -385,7 +460,7 @@ class Dialog:
                 if closed['close_requested']:
                     self._cancel_work(owner, draft['id'], 'user')
                 else:
-                    self._send(owner, tr(self._language(owner), 'dialog.cancelled', id=draft['id']), reply=draft['source_message_id'], purpose='cancellation')
+                    self._send(owner, tr(self._language(owner), 'dialog.cancelled', id=work_title(self.store, draft)), reply=draft['source_message_id'], purpose='cancellation')
         self._send(owner, tr(self._language(owner), 'dialog.cancel_requested'))
 
     def _command(self, owner, command):
@@ -478,12 +553,16 @@ class Dialog:
         if token.partition(':')[0] not in ACTIONS:
             return False
         try:
-            record = self.store.consume_token(owner, token)
+            record = self.store.get_token(owner, token)
         except StoreError:
             # Чужой токен не вызывает исходящих действий и не расходуется.
             return False
         try:
-            self._callback(owner, record)
+            if record['consumed_at'] is not None:
+                self._repeat_callback(owner, record)
+            else:
+                record = self.store.consume_token(owner, token)
+                self._callback(owner, record)
         except StoreError as exc:
             self._error(owner, exc)
         return True
@@ -503,11 +582,10 @@ class Dialog:
             self._send(owner, tr(self._language(owner), 'dialog.language_changed'), self._menu(owner))
         elif action == 'new_confirm':
             self._new(owner, confirmed=True, old_id=target)
-        elif action in ('files_added', 'advanced'):
-            draft = self._target(owner, target)
-            if action == 'files_added' and not any(f['role'] == 'media' and not f['removed'] for f in self.store.files(target)):
-                raise StoreError('draft_incomplete')
-            self._main_settings(owner, draft, advanced=action == 'advanced')
+        elif action == 'files_added':
+            self._files_added(owner, target)
+        elif action == 'advanced':
+            self._main_settings(owner, self._target(owner, target), advanced=True)
         elif action == 'choose':
             self._target(owner, target)
             key = payload['key']
@@ -545,7 +623,12 @@ class Dialog:
             self._main_settings(owner, self.store.get_draft(target, owner) if draft else None)
         elif action == 'materials':
             draft = self._target(owner, target)
-            self.store.update_draft(owner, target, status='collecting', input_signature=None, snapshot={})
+            state = dict(draft['ui_state'])
+            state.pop('finish_requested', None)
+            fields = {'ui_state': state, 'input_signature': None, 'snapshot': {}}
+            if draft['status'] != 'preparing':
+                fields['status'] = 'collecting'
+            self.store.update_draft(owner, target, **fields)
             self._send(owner, tr(self._language(owner), 'dialog.add_materials'), [[self._button(owner, 'button.files_added', 'files_added', target)]])
         elif action == 'youtube':
             draft = self._target(owner, target)
@@ -559,7 +642,7 @@ class Dialog:
             self.store.update_draft(owner, target, ui_state=state)
             self._intake(owner, target, {**source, 'youtube_mode': mode})
         elif action == 'summary':
-            self._summary(owner, target)
+            self._files_added(owner, target)
         elif action in ('submit', 'reuse', 'force_new'):
             draft, _, _, _, fingerprint = self._prepare(owner, target)
             if fingerprint != payload['fingerprint']:

@@ -16,6 +16,11 @@ class AnalysisError(ValueError):
     """Безопасный код отказа без внешнего stderr или серверного пути."""
 
 
+# Пределы предпросмотра: один кадр, ограниченные стороны и вес JPEG.
+_PREVIEW_MAX_BYTES = 262144
+_PREVIEW_MAX_SIDE = 640
+
+
 def media_metadata(info: dict, max_seconds: float) -> dict:
     """Принимать только известную конечную длительность и аудиодорожку."""
     value = (info.get("format") or {}).get("duration")
@@ -44,6 +49,68 @@ def pdf_pages(text: str, remaining_pages: int) -> int:
     if pages > remaining_pages:
         raise AnalysisError("material_pages_exceeded")
     return pages
+
+
+def _unlink(path: Path) -> None:
+    """Удалить временный файл, не подменяя исходную причину отказа."""
+    try:
+        path.unlink()
+    except OSError:
+        pass
+
+
+def _preview_position(duration: float) -> float:
+    """Выбрать представительный момент записи вместо первого чёрного кадра."""
+    position = min(duration * 0.1, 30.0)
+    if position >= duration:
+        position = duration * 0.5
+    return max(0.0, position)
+
+
+def extract_preview(source: Path, duration: float, directory: Path) -> dict | None:
+    """Извлечь один представительный кадр записи в ограниченный JPEG.
+
+    Кадр берётся только из самой записи; удалённые обложки не запрашиваются.
+    """
+    raw = directory / "preview.frame.jpg"
+    command = ["ffmpeg", "-v", "error", "-nostdin", "-y",
+               "-ss", f"{_preview_position(duration):.3f}", "-i", str(source),
+               "-frames:v", "1", "-vf", "scale=640:640:force_original_aspect_ratio=decrease",
+               "-threads", "1", "-f", "image2", str(raw)]
+    try:
+        _command(command, directory, timeout=60)
+    except AnalysisError:
+        _unlink(raw)
+        return None
+    if not raw.is_file() or raw.is_symlink():
+        _unlink(raw)
+        return None
+    target = directory / "preview.jpg"
+    try:
+        from PIL import Image
+        with Image.open(raw) as image:
+            image.load()
+            picture = image.convert("RGB")
+            picture.thumbnail((_PREVIEW_MAX_SIDE, _PREVIEW_MAX_SIDE))
+            width, height = picture.size
+            for quality in (80, 60, 40):
+                picture.save(target, format="JPEG", quality=quality, optimize=True)
+                if target.stat().st_size <= _PREVIEW_MAX_BYTES:
+                    break
+    except Exception:
+        _unlink(target)
+        return None
+    finally:
+        _unlink(raw)
+    try:
+        if not target.is_file() or target.stat().st_size > _PREVIEW_MAX_BYTES or target.stat().st_size <= 0:
+            _unlink(target)
+            return None
+    except OSError:
+        _unlink(target)
+        return None
+    return {"preview_relative_path": str(target.relative_to(directory.parent.parent)),
+            "preview_width": width, "preview_height": height}
 
 
 def _command(argv: list[str], directory: Path, *, timeout: float = 120) -> str:
@@ -80,9 +147,13 @@ def analyze(source: Path, role: str, max_seconds: float, remaining_pages: int,
             raise AnalysisError("invalid_duration" if str(exc) == "invalid_material"
                                 else "analysis_failed") from None
         try:
-            return media_metadata(json.loads(text), max_seconds)
+            info = json.loads(text)
+            metadata = media_metadata(info, max_seconds)
         except (json.JSONDecodeError, AttributeError, TypeError):
             raise AnalysisError("invalid_duration") from None
+        has_video = any(stream.get("codec_type") == "video" for stream in info.get("streams", []) if isinstance(stream, dict))
+        preview = extract_preview(source, metadata["duration"], directory) if has_video else None
+        return {**metadata, **(preview or {})}
     if role != "material":
         raise AnalysisError("unsupported_input")
     # Категории форматов определяет установленное ядро, а не второй каталог бота.

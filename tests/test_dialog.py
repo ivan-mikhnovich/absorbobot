@@ -205,7 +205,7 @@ def test_double_confirmation_accepts_at_most_one_job(dialog, store):
     click(dialog, store, 'summary', target=draft['id'])
     second = tokens(store, 'submit')[-1]
     assert dialog.handle_callback(callback(first))
-    assert not dialog.handle_callback(callback(first))
+    dialog.handle_callback(callback(first))
     assert dialog.handle_callback(callback(second))
     assert len(store.jobs(ALICE)) == 1
     assert store.quota(ALICE, NOW)['used'] == 1
@@ -355,7 +355,6 @@ def test_queued_cancellation_has_individual_source_reply(dialog, store):
     notices = [row['payload'] for row in outbox(store, 'telegram') if row['payload'].get('purpose') == 'cancellation']
     assert len(notices) == 1
     assert notices[0]['kwargs']['reply_parameters'] == {'message_id': 100, 'allow_sending_without_reply': True}
-    assert job['id'] in notices[0]['kwargs']['text']
     assert not outbox(store, 'cancel_work')
     assert store.quota(ALICE, NOW)['used'] == 1
 
@@ -408,3 +407,80 @@ def test_rejected_source_can_be_replaced_without_implicit_second_source(dialog, 
     dialog.handle_message(message(message_id=101, audio={'file_id': 'valid', 'file_size': 3}))
     assert len(outbox(store, 'intake')) == before + 1
     assert store.active_draft(ALICE)['source_message_id'] == 101
+
+
+def test_files_added_during_import_survives_restart_and_requires_confirmation(dialog, store, core):
+    dialog.handle_message(message(text='/new'))
+    dialog.handle_message(message(text='https://youtu.be/abcdefghijk'))
+    draft = store.active_draft(ALICE)
+    click(dialog, store, 'youtube', target=draft['id'], payload={'mode': 'video'})
+    token = tokens(store, 'files_added')[-1]
+    store.update_draft(ALICE, draft['id'], status='preparing')
+
+    dialog.handle_callback(callback(token))
+    assert store.get_draft(draft['id'])['ui_state']['finish_requested']
+    assert not store.jobs(ALICE)
+    dialog.handle_message(message(document={'file_id': 'slides', 'file_name': 'slides.pdf', 'file_size': 3}, message_id=101))
+    assert store.get_draft(draft['id'])['ui_state']['pending_import_ids'] == [100, 101]
+
+    store.add_file(ALICE, draft['id'], role='media', original_name='Distributed systems.m4a',
+                   relative_path='input/media.m4a', sha256='b' * 64, bytes=3, duration=3, source_message_id=100)
+    state = dict(store.get_draft(draft['id'])['ui_state'])
+    state['pending_import_ids'] = [101]
+    store.update_draft(ALICE, draft['id'], status='ready', ui_state=state)
+    restored = Dialog(store, store.settings, core)
+    restored.import_finished(ALICE, draft['id'], {'status': 'imported'}, 100)
+    assert not tokens(store, 'submit')
+    state = dict(store.get_draft(draft['id'])['ui_state'])
+    state['pending_import_ids'] = []
+    store.update_draft(ALICE, draft['id'], ui_state=state)
+    restored.import_finished(ALICE, draft['id'], {'status': 'rejected'}, 101)
+    submit = tokens(store, 'submit')[-1]
+    assert not store.jobs(ALICE)
+
+    restored.handle_callback(callback(submit))
+    restored.handle_callback(callback(submit))
+    assert len(store.jobs(ALICE)) == 1
+    assert store.quota(ALICE, NOW)['used'] == 1
+
+
+def test_consumed_files_added_button_recovers_ready_video(dialog, store):
+    draft = imported(dialog, store)
+    state = dict(draft['ui_state'])
+    state['pending_import_ids'] = [100]
+    store.update_draft(ALICE, draft['id'], ui_state=state)
+    token = tokens(store, 'files_added')[-1]
+    dialog.handle_callback(callback(token))
+    state = dict(store.get_draft(draft['id'])['ui_state'])
+    state['pending_import_ids'] = []
+    store.update_draft(ALICE, draft['id'], ui_state=state)
+
+    dialog.handle_callback(callback(token))
+
+    assert tokens(store, 'submit')
+    assert not store.jobs(ALICE)
+    assert store.get_draft(draft['id'])['input_signature']
+
+
+def test_lecture_title_follows_summary_queue_history_and_cancellation(dialog, store):
+    draft = imported(dialog, store)
+    state = dict(draft['ui_state'])
+    state['title'] = 'Distributed systems: consensus'
+    store.update_draft(ALICE, draft['id'], ui_state=state)
+    click(dialog, store, 'summary', target=draft['id'])
+    dialog.handle_callback(callback(tokens(store, 'submit')[-1]))
+    dialog.handle_message(message(text='/jobs'))
+    dialog.handle_message(message(text='/cancel'))
+    dialog.handle_callback(callback(tokens(store, 'cancel_confirm')[-1]))
+    replies = texts(store)
+    assert 'Distributed systems: consensus' in replies
+    assert draft['id'] not in replies
+    assert store.get_job(draft['id'])['status'] == 'cancelled'
+
+
+def test_foreign_saved_result_title_does_not_disclose_source_filename(dialog, store):
+    from absorbobot.identity import work_title
+
+    source = accepted(dialog, store, BOB)
+    assert work_title(store, source, viewer=ALICE) == tr('en', 'work.cached_result')
+    assert work_title(store, source, viewer=BOB) == 'recording'

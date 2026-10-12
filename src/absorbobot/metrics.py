@@ -653,6 +653,15 @@ class JournalIngestor:
         return [{"kind": "stage_start", "event": "stage_start", "stage": record.get("stage"), "seq": seq,
                  "timestamp_utc": record["timestamp_utc"]}]
 
+    def _event_stage_progress(self, state: dict, record: dict, seq: int) -> list[dict]:
+        completed, total = _finite(record.get("completed")), _finite(record.get("total"))
+        if (not isinstance(record.get("stage"), str) or record.get("unit") not in ("seconds", "images", "frames", "pages")
+                or completed is None or completed < 0 or total is not None and (total < 0 or completed > total)):
+            return [{"kind": "malformed"}]
+        return [{"kind": "stage_progress", "event": "stage_progress", "stage": record["stage"],
+                 "unit": record["unit"], "completed": completed, "total": total, "seq": seq,
+                 "timestamp_utc": record["timestamp_utc"]}]
+
     def _event_stage_end(self, state: dict, record: dict, seq: int) -> list[dict]:
         return [{"kind": "stage_end", "event": "stage_end", "stage": record.get("stage"),
                  "status": record.get("status"), "elapsed_seconds": _finite(record.get("elapsed_seconds")),

@@ -12,6 +12,7 @@ from pathlib import Path
 from uuid import UUID, uuid4
 
 from absorbobot.i18n import tr
+from absorbobot.identity import work_title
 from absorbobot.store import Store, StoreError, utc_now
 
 
@@ -213,9 +214,9 @@ class Delivery:
             for file in files:
                 contained_file(source_tree, file["file"])
             language = self.store.get_user(owner)["language"]
-            caption = tr(language, "delivery.caption", id=source_id,
-                         version=source["engine_version"], commit=source["engine_commit"])
             draft = self.store.get_draft(work_uuid, owner) if work_uuid else None
+            caption = tr(language, "delivery.caption", id=work_title(self.store, draft or source, viewer=owner),
+                         version=source["engine_version"], commit=source["engine_commit"])
             reply = draft["source_message_id"] if draft else None
             for index, file in enumerate(files):
                 kwargs = {"chat_id": owner, "caption": caption}

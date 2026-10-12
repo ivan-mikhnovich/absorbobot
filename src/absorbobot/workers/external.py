@@ -416,6 +416,8 @@ async def _write_stream(response, path: Path, limit: int, *, root: Path,
     existing = _tree_bytes(root)
     _check_free(root, min_free_bytes)
     length = response.content_length
+    declared = length if type(length) is int and length >= 0 else None
+    reporter = _progress_module().ProgressWriter(root, "external", "bytes", min_interval=0.5)
     if length is not None and length > limit:
         raise ExternalError("input_too_large")
     if existing > max_work_bytes:
@@ -437,6 +439,7 @@ async def _write_stream(response, path: Path, limit: int, *, root: Path,
             if usage.f_bavail * usage.f_frsize - len(chunk) < min_free_bytes:
                 raise ExternalError("storage_unavailable")
             stream.write(chunk)
+            reporter.update(total, declared)
     _check_free(root, min_free_bytes)
     if total <= 0:
         raise ExternalError("download_failed")
@@ -522,6 +525,15 @@ def _load_transport():
     return module
 
 
+def _progress_module():
+    """Загрузить модуль прогресса и в пакете, и при запуске как скрипта."""
+    try:
+        from . import progress as module
+    except ImportError:
+        import progress as module  # type: ignore[no-redef]
+    return module
+
+
 async def fetch(request: dict, *, root: Path | None = None, transport=None) -> dict:
     """Скачать файл по описанию запроса и вернуть безопасный результат."""
     if not isinstance(request, dict):
@@ -556,15 +568,19 @@ async def fetch(request: dict, *, root: Path | None = None, transport=None) -> d
         raise ExternalError("unsafe_file_path")
     module = transport or _load_transport()
     transport_error = getattr(module, "FetchError", None)
+    discard = _progress_module().discard_progress
     try:
         return await asyncio.wait_for(
             _run(url, tmp, base, media, material, max_media, max_material,
                  remaining, max_work, min_free, module, float(timeout), download_id), timeout)
     except asyncio.TimeoutError:
+        discard(base, "external")
         raise ExternalError("timeout") from None
     except ExternalError:
+        discard(base, "external")
         raise
     except Exception as exc:
+        discard(base, "external")
         if transport_error is not None and isinstance(exc, transport_error):
             code = getattr(exc, "code", None)
             raise ExternalError(code if isinstance(code, str) and code in _SAFE_CODES

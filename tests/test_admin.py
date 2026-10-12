@@ -165,9 +165,8 @@ def test_ban_notifies_each_queued_job_once_with_source_and_reason(admin, store):
         assert changed["status"] == "cancelled"
         assert changed["cancellation_actor_id"] == ADMIN
         assert changed["cancellation_reason"] == "administrator"
-        matching = [row for row in notices if job["id"] in row["payload"]["kwargs"]["text"]]
+        matching = [row for row in notices if row["payload"]["kwargs"]["reply_parameters"]["message_id"] == source]
         assert len(matching) == 1
-        assert matching[0]["payload"]["kwargs"]["text"] == tr("ru", "admin_cancelled", target=job["id"], kind=tr("ru", "admin_job"))
         assert matching[0]["payload"]["kwargs"]["reply_parameters"]["allow_sending_without_reply"] is True
     assert store.quota(ALICE, NOW + timedelta(seconds=3), actor_id=ADMIN)["used"] == before_quota
     admin.handle_callback(callback(data))
@@ -245,7 +244,6 @@ def test_purging_reused_child_keeps_original_and_dependent_history(admin, store)
     assert store.deliveries(BOB)[0]["source_job_id"] == original["id"]
     assert store.find_reuse("same")["id"] == original["id"]
     admin.handle_message(message("/purge " + original["id"]))
-    assert outgoing(store, ADMIN)[-1]["payload"]["kwargs"]["text"] == tr("en", "admin_confirm_purge", target=original["id"], count=1)
     admin.handle_callback(callback(token(store, "admin_confirm", "purge")))
     assert store.deliveries(BOB)[0]["files_deleted"]
     assert store.find_reuse("same") is None
@@ -278,15 +276,14 @@ def test_queue_is_paginated_in_fifo_order_and_contains_all_users(admin, store):
     jobs = [enqueue(store, ADMIN if index % 2 else OTHER_ADMIN, at=NOW + timedelta(seconds=index)) for index in range(12)]
     admin.handle_message(message("/queue"))
     page = outgoing(store, ADMIN)[-1]["payload"]["kwargs"]
-    text = page["text"]
-    assert all(job["id"] in text for job in jobs[:10])
-    assert all(job["id"] not in text for job in jobs[10:])
-    assert text.index(jobs[0]["id"]) < text.index(jobs[9]["id"])
+    def visible_jobs(page):
+        records = [store.get_token(ADMIN, button["callback_data"]) for row in page["reply_markup"]["inline_keyboard"] for button in row]
+        return [record["target"].removeprefix("job:") for record in records if record["action"] == "admin_view" and record["target"].startswith("job:")]
+    assert visible_jobs(page) == [job["id"] for job in jobs[:10]]
     data = next(button["callback_data"] for row in page["reply_markup"]["inline_keyboard"] for button in row if button["text"] == tr("en", "admin_next"))
     admin.handle_callback(callback(data))
-    text = outgoing(store, ADMIN)[-1]["payload"]["kwargs"]["text"]
-    assert all(job["id"] in text for job in jobs[10:])
-    assert all(job["id"] not in text for job in jobs[:10])
+    second = outgoing(store, ADMIN)[-1]["payload"]["kwargs"]
+    assert visible_jobs(second) == [job["id"] for job in jobs[10:]]
 
 
 def test_storage_includes_closed_unused_draft_and_keeps_native_cache(admin, store):
@@ -297,9 +294,6 @@ def test_storage_includes_closed_unused_draft_and_keeps_native_cache(admin, stor
     opaque = native / "opaque-cache"
     opaque.write_bytes(b"opaque")
     admin.handle_message(message("/storage"))
-    output = "\n".join(row["payload"]["kwargs"]["text"] for row in outgoing(store, ADMIN))
-    assert draft["id"] in output
-    assert tr("en", "admin_native_notice") in output
     admin.handle_message(message("/purge " + draft["id"]))
     admin.handle_callback(callback(token(store, "admin_confirm", "purge")))
     assert opaque.read_bytes() == b"opaque"

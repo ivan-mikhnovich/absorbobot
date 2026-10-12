@@ -23,6 +23,7 @@ from .metrics import aggregate_reports
 from .store import StoreError, utc_now
 from .workers.youtube import YouTubeError, normalize_youtube_url, tree_bytes
 from .workers.external import normalize_external_url
+from .workers.progress import ProgressWriter, read_progress, discard_progress
 
 
 class IntakeError(ValueError):
@@ -174,14 +175,15 @@ def _open_contained(source: Path, root: Path) -> int:
 
 def copy_and_hash(source: Path, target: Path, *, source_root: Path, work_root: Path,
                   byte_limit: int, work_limit: int, min_free_bytes: int,
-                  cancelled: threading.Event | None = None) -> dict:
+                  cancelled: threading.Event | None = None, progress=None) -> dict:
     """Копировать ограниченными блоками, учитывая фактический размер и диск."""
     fd = _open_contained(source, source_root)
     try:
         existing = tree_bytes(work_root)
-        if os.fstat(fd).st_size > byte_limit:
+        total = os.fstat(fd).st_size
+        if total > byte_limit:
             raise IntakeError("input_too_large")
-        if existing + os.fstat(fd).st_size > work_limit:
+        if existing + total > work_limit:
             raise IntakeError("work_limit")
         if target.parent.is_symlink() or not target.parent.resolve().is_relative_to(work_root.resolve()):
             raise IntakeError("unsafe_file_path")
@@ -210,6 +212,8 @@ def copy_and_hash(source: Path, target: Path, *, source_root: Path, work_root: P
                         raise IntakeError("storage_unavailable")
                     output.write(chunk)
                     digest.update(chunk)
+                    if progress is not None:
+                        progress(size, total)
                 output.flush()
                 os.fsync(output.fileno())
             if size <= 0:
@@ -265,6 +269,44 @@ def _preparation_wall(preparation: object) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
         return 0.0
     return float(value)
+
+
+def _stat_size(path: Path) -> tuple[int, int] | None:
+    """Фактический размер готового файла как финальные счётчики стадии."""
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return None
+    return (size, size) if size > 0 else None
+
+
+_PREVIEW_MAX_BYTES = 262144
+_PREVIEW_MAX_SIDE = 4096
+
+
+def _preview_reference(root: Path, data: dict) -> str | None:
+    """Проверить путь предпросмотра из ответа worker перед показом потребителю."""
+    relative = data.get("preview_relative_path")
+    if not isinstance(relative, str) or not relative:
+        return None
+    path = Path(relative)
+    if path.is_absolute() or ".." in path.parts or not path.parts or path.parts[0] != "tmp":
+        return None
+    width, height = data.get("preview_width"), data.get("preview_height")
+    if (type(width) is not int or type(height) is not int
+            or not 0 < width <= _PREVIEW_MAX_SIDE or not 0 < height <= _PREVIEW_MAX_SIDE):
+        return None
+    target = root / path
+    try:
+        if target.is_symlink() or not target.is_file():
+            return None
+        if not target.resolve().is_relative_to(root.resolve()):
+            return None
+        if not 0 < target.stat().st_size <= _PREVIEW_MAX_BYTES:
+            return None
+    except OSError:
+        return None
+    return relative
 
 
 def _worker_result(result: dict) -> dict:
@@ -357,6 +399,95 @@ class Intake:
             self.store.db.execute("UPDATE drafts SET ui_state=? WHERE id=? AND owner_id=?",
                                   (json.dumps(state, ensure_ascii=False, allow_nan=False), work_uuid, owner))
 
+    _PROGRESS_POLL_SECONDS = 0.5
+    _PROGRESS_WRITE_SECONDS = 1.0
+
+    def _merge_ui_state(self, owner: int, work_uuid: str, **values) -> None:
+        """Слить ключи в ui_state, не затирая соседние поля и закрытый черновик."""
+        with self.store.transaction():
+            draft = self.store.get_draft(work_uuid)
+            if not draft or draft["owner_id"] != owner:
+                return
+            state = dict(draft["ui_state"])
+            for key, value in values.items():
+                if value is None:
+                    state.pop(key, None)
+                else:
+                    state[key] = value
+            self.store.db.execute("UPDATE drafts SET ui_state=? WHERE id=? AND owner_id=?",
+                                  (json.dumps(state, ensure_ascii=False, allow_nan=False), work_uuid, owner))
+
+    def _store_import_progress(self, owner: int, work_uuid: str, value: dict | None) -> None:
+        """Перенести отметку прогресса стадии в состояние черновика."""
+        self._merge_ui_state(owner, work_uuid, import_progress=value)
+
+    @staticmethod
+    def _progress_value(tracker: dict, completed: int, total: int | None) -> dict:
+        """Собрать отметку прогресса стадии без выдуманных процентов и ETA."""
+        value = {"stage": tracker["stage"], "unit": tracker["unit"], "completed": int(completed),
+                 "started_at": tracker["started_at"], "updated_at": utc_now().isoformat()}
+        if total is not None:
+            value["total"] = int(total)
+        return value
+
+    async def _poll_progress(self, owner: int, work_uuid: str, root: Path, stage: str,
+                             unit: str, tracker: dict) -> None:
+        """Переносить фактические счётчики стадии в ui_state не чаще раза в секунду."""
+        while True:
+            await asyncio.sleep(self._PROGRESS_POLL_SECONDS)
+            try:
+                record = read_progress(root, stage, unit)
+                if record is None:
+                    continue
+                if record["completed"] == tracker.get("stored_completed") and record["total"] == tracker.get("stored_total"):
+                    continue
+                tracker["completed"] = record["completed"]
+                tracker["total"] = record["total"]
+                now = time.monotonic()
+                if now - tracker["last_write"] < self._PROGRESS_WRITE_SECONDS:
+                    continue
+                tracker["last_write"] = now
+                tracker["stored_completed"], tracker["stored_total"] = record["completed"], record["total"]
+                self._store_import_progress(owner, work_uuid,
+                    self._progress_value(tracker, record["completed"], record["total"]))
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # Учёт прогресса не должен ронять импорт или гасить монитор.
+                continue
+
+    @contextlib.asynccontextmanager
+    async def _track(self, owner: int, work_uuid: str, root: Path, stage: str, unit: str,
+                     *, total: int | None = None):
+        """Вести фактический прогресс одной стадии импорта в состоянии черновика.
+
+        Стадия выставляет начальную отметку сразу, читает фактические счётчики
+        worker'а или потока копирования и закрывается только при успехе: отмена
+        и отказ не выдают ложный финальный прогресс.
+        """
+        tracker = {"stage": stage, "unit": unit, "started_at": utc_now().isoformat(),
+                   "completed": 0, "total": total, "last_write": float("-inf")}
+        self._store_import_progress(owner, work_uuid, self._progress_value(tracker, 0, total))
+        poller = asyncio.create_task(self._poll_progress(owner, work_uuid, root, stage, unit, tracker))
+        progress = {"final": None}
+        try:
+            yield progress
+        except BaseException:
+            poller.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await poller
+            raise
+        else:
+            poller.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await poller
+            completed, final_total = progress["final"] or (tracker["completed"], tracker["total"])
+            try:
+                self._store_import_progress(owner, work_uuid,
+                    self._progress_value(tracker, completed, final_total))
+            except Exception:
+                pass
+
     @contextlib.asynccontextmanager
     async def _operation(self, owner: int, work_uuid: str, name: str):
         """Измерить операцию подготовки и сохранить её исход даже при отказе или отмене."""
@@ -389,6 +520,7 @@ class Intake:
     async def _copy(self, source: Path, target: Path, *, source_root: Path, work_root: Path,
                     byte_limit: int, usage: dict) -> dict:
         cancelled = threading.Event()
+        reporter = ProgressWriter(work_root, "copy", "bytes", min_interval=0.5)
 
         def run() -> dict:
             started = time.monotonic()
@@ -396,7 +528,8 @@ class Intake:
             try:
                 return copy_and_hash(source, target, source_root=source_root, work_root=work_root,
                                      byte_limit=byte_limit, work_limit=self.settings.max_work_bytes,
-                                     min_free_bytes=self.settings.min_free_bytes, cancelled=cancelled)
+                                     min_free_bytes=self.settings.min_free_bytes, cancelled=cancelled,
+                                     progress=reporter.update)
             finally:
                 after_user, after_system = _thread_cpu()
                 usage.update(wall_seconds=time.monotonic() - started,
@@ -435,12 +568,14 @@ class Intake:
             raise IntakeError("input_too_large")
         return limit, remaining
 
-    async def _download_telegram(self, remote_path: str, target: Path, root: Path, limit: int) -> None:
+    async def _download_telegram(self, remote_path: str, target: Path, root: Path, limit: int,
+                                 *, total: int | None = None) -> None:
         """Скачать cloud-вложение ограниченными блоками без токена в журнале."""
         if (not re.fullmatch(r"[A-Za-z0-9_/-]+\.[A-Za-z0-9]+", remote_path)
                 or remote_path.startswith("/") or ".." in remote_path.split("/")):
             raise IntakeError("unsafe_file_path")
         existing, size = tree_bytes(root), 0
+        reporter = ProgressWriter(root, "telegram", "bytes", min_interval=0.5)
         try:
             fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
             with os.fdopen(fd, "wb") as output:
@@ -457,6 +592,7 @@ class Intake:
                         if usage.f_bavail * usage.f_frsize - len(chunk) < self.settings.min_free_bytes:
                             raise IntakeError("storage_unavailable")
                         output.write(chunk)
+                        reporter.update(size, total)
                 output.flush()
                 os.fsync(output.fileno())
             if not size:
@@ -467,12 +603,36 @@ class Intake:
                 raise
             raise IntakeError("timeout" if isinstance(exc, TimeoutError) else "telegram_file_unavailable") from None
 
+    async def lookup_youtube_metadata(self, owner: int, work_uuid: str, url: str) -> dict:
+        """Прочитать метаданные уже загруженной записи без повторной загрузки.
+
+        Вспомогательный режим восстановления: он не трогает файлы задания, а
+        только переносит фактический заголовок в состояние черновика.
+        """
+        canonical = normalize_youtube_url(url)
+        video_id = canonical.rsplit("=", 1)[1]
+        runtime = {"tool_env": sys.prefix, "python_executable": sys.executable,
+                   "python_base_prefix": sys.base_prefix}
+        result = await self.sandbox.run(
+            work_uuid, "youtube", [runtime["python_executable"], "/workers/youtube.py",
+            "--metadata", video_id, str(self.settings.max_media_seconds)],
+            runtime=runtime, env={}, network=True, selected_key_names=(),
+            timeout=min(600, self.settings.max_processing_seconds))
+        data = _worker_result(result)
+        title = data.get("title")
+        if isinstance(title, str) and title:
+            self._merge_ui_state(owner, work_uuid, title=title)
+            return {"duration": data.get("duration"), "title": title}
+        return {"duration": data.get("duration"), "title": None}
+
     async def handle(self, payload: dict) -> dict:
         owner, work_uuid, message = payload["owner_id"], payload["draft_id"], payload["message"]
         message_id = message.get("message_id")
         if type(message_id) is not int or message_id <= 0:
             raise IntakeError("invalid_file_metadata")
         completed, preparing, youtube, external = True, False, False, False
+        display_title, preview = None, None
+        root = None
         cleanup: list[Path] = []
         try:
             if not self.store.authorized(owner):
@@ -519,18 +679,25 @@ class Intake:
                 runtime = {"tool_env": sys.prefix, "python_executable": sys.executable,
                            "python_base_prefix": sys.base_prefix}
                 async with self._operation(owner, work_uuid, "youtube") as outcome:
-                    result = await self.sandbox.run(
-                        work_uuid, "youtube", [runtime["python_executable"], "/workers/youtube.py",
-                        url.rsplit("=", 1)[1], mode, str(limit), str(self.settings.max_media_seconds),
-                        str(self.settings.max_work_bytes), str(self.settings.min_free_bytes)],
-                        runtime=runtime, env={}, network=True, selected_key_names=(),
-                        timeout=self.settings.max_processing_seconds)
-                    outcome["resources"] = _phase_resources(result.get("resource_report"), "input_youtube")
-                    data = _worker_result(result)
-                    relative = Path(data["relative_path"])
-                    if relative.is_absolute() or ".." in relative.parts or not relative.parts or relative.parts[0] != "tmp":
-                        raise IntakeError("unsafe_file_path")
-                    source, source_root = root / relative, root / "tmp"
+                    async with self._track(owner, work_uuid, root, "youtube", "bytes") as track:
+                        result = await self.sandbox.run(
+                            work_uuid, "youtube", [runtime["python_executable"], "/workers/youtube.py",
+                            url.rsplit("=", 1)[1], mode, str(limit), str(self.settings.max_media_seconds),
+                            str(self.settings.max_work_bytes), str(self.settings.min_free_bytes)],
+                            runtime=runtime, env={}, network=True, selected_key_names=(),
+                            timeout=self.settings.max_processing_seconds)
+                        outcome["resources"] = _phase_resources(result.get("resource_report"), "input_youtube")
+                        data = _worker_result(result)
+                        relative = Path(data["relative_path"])
+                        if relative.is_absolute() or ".." in relative.parts or not relative.parts or relative.parts[0] != "tmp":
+                            raise IntakeError("unsafe_file_path")
+                        source, source_root = root / relative, root / "tmp"
+                        title = data.get("title")
+                        if isinstance(title, str) and title:
+                            # Показываем фактический заголовок, а не идентификатор видео.
+                            descriptor["original_name"] = title + extension
+                            display_title = title
+                        track["final"] = _stat_size(source)
             elif external:
                 runtime = {"tool_env": sys.prefix, "python_executable": sys.executable,
                            "python_base_prefix": sys.base_prefix}
@@ -550,89 +717,113 @@ class Intake:
                                "min_free_bytes": self.settings.min_free_bytes}, handle)
                 cleanup.append(request)
                 async with self._operation(owner, work_uuid, "external") as outcome:
-                    result = await self.sandbox.run(
-                        work_uuid, "external", [sys.executable, "/workers/external.py", "/work/tmp/" + request.name],
-                        runtime=runtime, env={}, network=True, selected_key_names=(),
-                        timeout=min(600, self.settings.max_processing_seconds))
-                    outcome["resources"] = _phase_resources(result.get("resource_report"), "input_external")
-                    data = _worker_result(result)
-                    relative = Path(data.get("relative_path", ""))
-                    if (relative.is_absolute() or ".." in relative.parts or len(relative.parts) != 2
-                            or relative.parts[0] != "tmp" or relative.stem != download_id):
-                        raise IntakeError("unsafe_file_path")
-                    source, source_root = root / relative, root / "tmp"
-                    if source not in cleanup:
-                        raise IntakeError("unsafe_file_path")
-                    role, extension, size = data.get("role"), data.get("extension"), data.get("bytes")
-                    if (role not in ("media", "material") or type(size) is not int or size <= 0
-                            or extension not in _extensions(self.core[role + "_extensions"])
-                            or not isinstance(data.get("original_name"), str)):
-                        raise IntakeError("invalid_file_metadata")
-                    descriptor = {"role": role, "extension": extension, "bytes": size,
-                                  "original_name": data["original_name"]}
-                    limit, remaining_pages = self._limits(files, role, size)
+                    async with self._track(owner, work_uuid, root, "external", "bytes") as track:
+                        result = await self.sandbox.run(
+                            work_uuid, "external", [sys.executable, "/workers/external.py", "/work/tmp/" + request.name],
+                            runtime=runtime, env={}, network=True, selected_key_names=(),
+                            timeout=min(600, self.settings.max_processing_seconds))
+                        outcome["resources"] = _phase_resources(result.get("resource_report"), "input_external")
+                        data = _worker_result(result)
+                        relative = Path(data.get("relative_path", ""))
+                        if (relative.is_absolute() or ".." in relative.parts or len(relative.parts) != 2
+                                or relative.parts[0] != "tmp" or relative.stem != download_id):
+                            raise IntakeError("unsafe_file_path")
+                        source, source_root = root / relative, root / "tmp"
+                        if source not in cleanup:
+                            raise IntakeError("unsafe_file_path")
+                        role, extension, size = data.get("role"), data.get("extension"), data.get("bytes")
+                        if (role not in ("media", "material") or type(size) is not int or size <= 0
+                                or extension not in _extensions(self.core[role + "_extensions"])
+                                or not isinstance(data.get("original_name"), str)):
+                            raise IntakeError("invalid_file_metadata")
+                        descriptor = {"role": role, "extension": extension, "bytes": size,
+                                      "original_name": data["original_name"]}
+                        limit, remaining_pages = self._limits(files, role, size)
+                        track["final"] = (size, size)
             else:
-                try:
-                    remote = await self.bot.get_file(descriptor["file_id"])
-                except Exception:
-                    raise IntakeError("telegram_file_unavailable") from None
-                remote_path = remote.get("file_path") if isinstance(remote, dict) else getattr(remote, "file_path", None)
-                remote_size = remote.get("file_size") if isinstance(remote, dict) else getattr(remote, "file_size", None)
-                if remote_size is not None and (type(remote_size) is not int or remote_size < 0 or remote_size > limit):
-                    raise IntakeError("input_too_large")
-                if not isinstance(remote_path, str) or not remote_path:
-                    raise IntakeError("unsafe_file_path")
-                if self.settings.bot_api_url == "https://api.telegram.org":
-                    source, source_root = root / "tmp" / (uuid4().hex + descriptor["extension"]), root / "tmp"
-                    cleanup.append(source)
-                    limit = min(limit, 20000000)
-                    async with self._operation(owner, work_uuid, "telegram") as outcome:
-                        await self._download_telegram(remote_path, source, root, limit)
-                        outcome["resources"] = _missing_resources("input_telegram")
-                else:
-                    source, source_root = Path(remote_path), self.settings.storage_dir / "telegram-api-files"
+                async with self._track(owner, work_uuid, root, "telegram", "bytes",
+                                       total=descriptor["bytes"]) as track:
+                    try:
+                        remote = await self.bot.get_file(descriptor["file_id"])
+                    except Exception:
+                        raise IntakeError("telegram_file_unavailable") from None
+                    remote_path = remote.get("file_path") if isinstance(remote, dict) else getattr(remote, "file_path", None)
+                    remote_size = remote.get("file_size") if isinstance(remote, dict) else getattr(remote, "file_size", None)
+                    if remote_size is not None and (type(remote_size) is not int or remote_size < 0 or remote_size > limit):
+                        raise IntakeError("input_too_large")
+                    if not isinstance(remote_path, str) or not remote_path:
+                        raise IntakeError("unsafe_file_path")
+                    if self.settings.bot_api_url == "https://api.telegram.org":
+                        source, source_root = root / "tmp" / (uuid4().hex + descriptor["extension"]), root / "tmp"
+                        cleanup.append(source)
+                        limit = min(limit, 20000000)
+                        async with self._operation(owner, work_uuid, "telegram") as outcome:
+                            await self._download_telegram(remote_path, source, root, limit,
+                                                          total=descriptor["bytes"])
+                            outcome["resources"] = _missing_resources("input_telegram")
+                        track["final"] = _stat_size(source)
+                    else:
+                        source, source_root = Path(remote_path), self.settings.storage_dir / "telegram-api-files"
+                        track["final"] = _stat_size(source)
             self._draft(owner, work_uuid)
             target = root / "input" / (uuid4().hex + descriptor["extension"])
             async with self._operation(owner, work_uuid, "copy") as outcome:
                 usage: dict = {}
-                try:
-                    content = await self._copy(source, target, source_root=source_root, work_root=root,
-                                               byte_limit=limit, usage=usage)
-                finally:
-                    # Даже отменённое копирование сохраняет измеренный CPU своего потока.
-                    outcome["wall_seconds"] = usage.get("wall_seconds")
-                    outcome["resources"] = _copy_resources(usage)
+                async with self._track(owner, work_uuid, root, "copy", "bytes",
+                                       total=descriptor["bytes"] or None) as track:
+                    try:
+                        content = await self._copy(source, target, source_root=source_root, work_root=root,
+                                                   byte_limit=limit, usage=usage)
+                    finally:
+                        # Даже отменённое копирование сохраняет измеренный CPU своего потока.
+                        outcome["wall_seconds"] = usage.get("wall_seconds")
+                        outcome["resources"] = _copy_resources(usage)
+                    track["final"] = (content["bytes"], content["bytes"])
             self._draft(owner, work_uuid)
             runtime = self.core["runtime"]
             async with self._operation(owner, work_uuid, "analyze") as outcome:
-                result = await self.sandbox.run(
-                    work_uuid, "analyze", [runtime["python_executable"], "/workers/analyze.py",
-                    "/work/input/" + target.name, descriptor["role"], str(self.settings.max_media_seconds),
-                    str(remaining_pages)], runtime=runtime, env={}, network=False, selected_key_names=(),
-                    timeout=min(self.settings.max_processing_seconds, 180))
-                outcome["resources"] = _phase_resources(result.get("resource_report"), "input_analyze")
-                data = _worker_result(result)
-                # Перепроверить consumer boundary, даже если worker сообщил успех.
-                if descriptor["role"] == "media":
-                    duration, pages = data.get("duration"), None
-                    if type(duration) not in (int, float) or not math.isfinite(duration) or duration <= 0:
-                        raise IntakeError("invalid_duration")
-                    if duration > self.settings.max_media_seconds:
-                        raise IntakeError("media_too_long")
-                else:
-                    duration, pages = None, data.get("pages")
-                    if type(pages) is not int or pages <= 0:
-                        raise IntakeError("invalid_material")
-                    if pages > remaining_pages:
-                        raise IntakeError("material_pages_exceeded")
+                async with self._track(owner, work_uuid, root, "analyze", "items", total=1) as track:
+                    result = await self.sandbox.run(
+                        work_uuid, "analyze", [runtime["python_executable"], "/workers/analyze.py",
+                        "/work/input/" + target.name, descriptor["role"], str(self.settings.max_media_seconds),
+                        str(remaining_pages)], runtime=runtime, env={}, network=False, selected_key_names=(),
+                        timeout=min(self.settings.max_processing_seconds, 180))
+                    outcome["resources"] = _phase_resources(result.get("resource_report"), "input_analyze")
+                    data = _worker_result(result)
+                    # Перепроверить consumer boundary, даже если worker сообщил успех.
+                    if descriptor["role"] == "media":
+                        duration, pages = data.get("duration"), None
+                        if type(duration) not in (int, float) or not math.isfinite(duration) or duration <= 0:
+                            raise IntakeError("invalid_duration")
+                        if duration > self.settings.max_media_seconds:
+                            raise IntakeError("media_too_long")
+                        preview = _preview_reference(root, data)
+                    else:
+                        duration, pages = None, data.get("pages")
+                        if type(pages) is not int or pages <= 0:
+                            raise IntakeError("invalid_material")
+                        if pages > remaining_pages:
+                            raise IntakeError("material_pages_exceeded")
+                    track["final"] = (1, 1)
             draft = self._draft(owner, work_uuid)
+            # Заголовок и предпросмотр — человекочитаемая идентичность, не UUID хранения.
+            state = dict(draft["ui_state"])
+            if descriptor["role"] == "media":
+                if display_title is None and not youtube:
+                    display_title = PurePath(descriptor["original_name"]).stem or None
+                if display_title:
+                    state["title"] = display_title
+                if preview:
+                    state["preview_relative_path"] = preview
+                else:
+                    state.pop("preview_relative_path", None)
             # Store остаётся исключительно в event-loop thread.
             with self.store.transaction():
                 self._limits(self.store.files(work_uuid), descriptor["role"], content["bytes"])
                 file = self.store.add_file(owner, work_uuid, role=descriptor["role"],
                     original_name=descriptor["original_name"], relative_path="input/" + target.name,
                     **content, duration=duration, pages=pages, source_message_id=message_id)
-                fields = {"status": "ready", "failure_reason": None}
+                fields = {"status": "ready", "failure_reason": None, "ui_state": state}
                 if descriptor["role"] == "media":
                     fields.update(source_message_id=message_id, source_chat_id=owner)
                 if youtube:
@@ -667,6 +858,10 @@ class Intake:
             for temporary in cleanup:
                 with contextlib.suppress(OSError):
                     temporary.unlink(missing_ok=True)
+            if root is not None:
+                # Progress-файлы — внутренний транспорт; в дереве задания не остаются.
+                for stage in ("youtube", "external", "telegram", "copy", "analyze"):
+                    discard_progress(root, stage)
             if completed:
                 self._clear_pending(owner, work_uuid, message_id)
 
@@ -679,3 +874,5 @@ class Intake:
                             for file in self.store.files(work_uuid))
             status = "failed" if terminal else ("ready" if has_media else "collecting")
             self.store.update_draft(owner, work_uuid, status=status, failure_reason=code)
+            # Отказ или отмена не оставляют ложный незавершённый прогресс.
+            self._merge_ui_state(owner, work_uuid, import_progress=None)

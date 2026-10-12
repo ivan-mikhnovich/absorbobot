@@ -9,6 +9,7 @@ from pathlib import Path
 from uuid import UUID
 
 from .i18n import tr
+from .identity import work_title
 from .store import StoreError, TERMINAL_JOBS, utc_now
 
 
@@ -224,7 +225,7 @@ class Admin:
         keyboard = []
         for row in rows[:PAGE_SIZE]:
             job = self.store.get_job(row["id"])
-            text.append(self._t(actor, "job_row", id=job["id"], owner=job["owner_id"], status=self._status(actor, job["status"]), position=self._value(actor, self.store.queue_position(job["id"]))))
+            text.append(self._t(actor, "job_row", id=work_title(self.store, job, viewer=actor), owner=job["owner_id"], status=self._status(actor, job["status"]), position=self._value(actor, self.store.queue_position(job["id"]))))
             keyboard.append([self._button(actor, "details", "admin_view", "job:" + job["id"])])
         if not rows:
             text.append(self._t(actor, "empty"))
@@ -249,7 +250,7 @@ class Admin:
         job = self.store.get_job(_work_id(target))
         if not job:
             raise StoreError("not_found")
-        text = [self._t(actor, "job_detail", id=job["id"], owner=job["owner_id"], status=self._status(actor, job["status"]), accepted=job["accepted_at"], initial=job["initial_accepted_at"], version=self._value(actor, job["engine_version"]), commit=self._value(actor, job["engine_commit"]), counted=self._t(actor, "yes" if job["quota_counted"] else "no"), deleted=self._t(actor, "yes" if job["files_deleted"] else "no"))]
+        text = [self._t(actor, "job_detail", id=work_title(self.store, job, viewer=actor), owner=job["owner_id"], status=self._status(actor, job["status"]), accepted=job["accepted_at"], initial=job["initial_accepted_at"], version=self._value(actor, job["engine_version"]), commit=self._value(actor, job["engine_commit"]), counted=self._t(actor, "yes" if job["quota_counted"] else "no"), deleted=self._t(actor, "yes" if job["files_deleted"] else "no"))]
         for category, model in job["models"].items():
             text.append(self._t(actor, "model_row", category=category, name=model.get("name", self._t(actor, "unknown")), provider=(model.get("provider") or {}).get("name", self._t(actor, "unknown")), location=self._t(actor, "local" if model.get("local") else "cloud")))
         for field in ("language", "output_language", "fps", "hash_threshold", "min_scene_seconds", "slides_dpi", "youtube_mode"):
@@ -303,7 +304,8 @@ class Admin:
         bound = {binding["work_uuid"] for binding in self.store.process_bindings()}
         for row in visible:
             status = row["job_status"] or row["status"]
-            text.append(self._t(actor, "storage_row", id=row["id"], owner=row["owner_id"], kind=self._t(actor, "job" if row["job_status"] else "draft"), status=self._status(actor, status), bytes=self._value(actor, row["storage_bytes"]), deleted=self._t(actor, "yes" if row["files_deleted"] else "no")))
+            work = self.store.get_job(row["id"]) or self.store.get_draft(row["id"])
+            text.append(self._t(actor, "storage_row", id=work_title(self.store, work, viewer=actor), owner=row["owner_id"], kind=self._t(actor, "job" if row["job_status"] else "draft"), status=self._status(actor, status), bytes=self._value(actor, row["storage_bytes"]), deleted=self._t(actor, "yes" if row["files_deleted"] else "no")))
             terminal = row["job_status"] in TERMINAL_JOBS if row["job_status"] else status in ("closed", "failed", "ready", "deleted")
             if terminal and row["id"] not in bound and not row["files_deleted"]:
                 keyboard.append([self._button(actor, "purge", "admin_prompt", "purge", target=row["id"])])
@@ -329,7 +331,7 @@ class Admin:
             if job["status"] in TERMINAL_JOBS or job["status"] == "cancel_requested":
                 self._send(actor, self._t(actor, "nothing_cancelled"))
                 return
-            text = self._t(actor, "confirm_cancel", target=target)
+            text = self._t(actor, "confirm_cancel", target=work_title(self.store, job, viewer=actor))
         elif action == "purge":
             draft = self.store.get_draft(_work_id(target))
             if not draft:
@@ -338,7 +340,7 @@ class Admin:
             if any(row["work_uuid"] == target for row in self.store.process_bindings()) or (job and job["status"] not in TERMINAL_JOBS) or (not job and draft["status"] not in ("closed", "failed", "ready", "deleted")):
                 raise StoreError("work_active")
             count = self.store.db.execute("SELECT COUNT(*) FROM deliveries WHERE source_job_id=? AND owner_id<>?", (target, draft["owner_id"])).fetchone()[0]
-            text = self._t(actor, "confirm_purge", target=target, count=count)
+            text = self._t(actor, "confirm_purge", target=work_title(self.store, draft, viewer=actor), count=count)
         else:
             raise StoreError("invalid_arguments")
         self._send(actor, text, [[self._button(actor, "confirm", "admin_confirm", action, target=target)], self._home_button(actor)])
@@ -355,10 +357,11 @@ class Admin:
                 raise StoreError("not_found")
             actions = self.store.request_cancel(job["owner_id"], [target], actor_id=actor, reason="administrator", now_utc=utc_now())
             self._cancel_actions(actor, actions)
-            self._send(actor, self._t(actor, "cancel_notice" if actions else "nothing_cancelled", target=target))
+            self._send(actor, self._t(actor, "cancel_notice" if actions else "nothing_cancelled", target=work_title(self.store, job, viewer=actor)))
         elif action == "purge":
             result = self.store.purge(actor, _work_id(target))
-            self._send(actor, self._t(actor, "purged", target=target, count=result["dependent_deliveries"]))
+            work = self.store.get_draft(target)
+            self._send(actor, self._t(actor, "purged", target=work_title(self.store, work, viewer=actor), count=result["dependent_deliveries"]))
         else:
             raise StoreError("invalid_arguments")
 
@@ -369,4 +372,4 @@ class Admin:
             if stopping:
                 self.store.add_outbox("cancel_work", {"work_uuid": work_id, "owner_id": owner, "actor_id": actor, "reason": "administrator"}, dedupe_key=f"admin-stop:{work_id}")
             else:
-                self._send(owner, self._t(owner, "cancelled", target=work_id, kind=self._t(owner, "draft" if work.get("kind") == "draft" else "job")), source=work.get("source_message_id"), dedupe=f"admin-cancellation:{work_id}", purpose="cancellation")
+                self._send(owner, self._t(owner, "cancelled", target=work_title(self.store, work), kind=self._t(owner, "draft" if work.get("kind") == "draft" else "job")), source=work.get("source_message_id"), dedupe=f"admin-cancellation:{work_id}", purpose="cancellation")

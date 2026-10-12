@@ -9,6 +9,7 @@ import pytest
 from absorbobot.workers.youtube import (
     DownloadBudget,
     YouTubeError,
+    clean_title,
     download,
     normalize_youtube_url,
     tree_bytes,
@@ -161,3 +162,36 @@ def test_download_refuses_unknown_video_id_and_mode_before_filesystem():
     with pytest.raises(YouTubeError) as error:
         download(VIDEO, "both", 10, 10, 10, 10)
     assert str(error.value) == "invalid_youtube_url"
+
+
+def test_validate_metadata_reports_actual_title_but_omits_absent_one():
+    # Заголовок приходит только из фактических метаданных, не из идентификатора.
+    assert validate_metadata(metadata(duration=100, title="Lecture 1"), VIDEO, 14400) == {
+        "duration": 100, "title": "Lecture 1"}
+    assert validate_metadata(metadata(duration=100), VIDEO, 14400) == {"duration": 100}
+
+
+def test_clean_title_strips_controls_trims_and_bounds():
+    assert clean_title("  Line\x00 one  ") == "Line one"
+    assert clean_title("x" * 500) == "x" * 300
+    assert clean_title(None) is None
+    assert clean_title("   ") is None
+    assert clean_title(42) is None
+
+
+def test_split_video_stream_progress_never_uses_one_stream_total(tmp_path):
+    from absorbobot.workers.progress import ProgressWriter, read_progress
+
+    root = tmp_path / "work"
+    directory = root / "tmp" / "youtube"
+    directory.mkdir(parents=True)
+    video, audio = directory / "video.mp4", directory / "audio.m4a"
+    video.write_bytes(b"x" * 60)
+    audio.write_bytes(b"x" * 10)
+    writer = ProgressWriter(root, "youtube", "bytes", min_interval=0)
+    budget = DownloadBudget(directory, 1000, report=writer.update)
+    budget({"filename": str(video), "downloaded_bytes": 60, "total_bytes": 60})
+    budget({"filename": str(audio), "downloaded_bytes": 10, "total_bytes": 20})
+    current = read_progress(root, "youtube", "bytes")
+    assert current["completed"] == 70
+    assert current["total"] is None

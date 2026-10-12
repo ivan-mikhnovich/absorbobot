@@ -23,6 +23,7 @@ from absorbobot.intake import (
 )
 from absorbobot.store import Store, StoreError
 import absorbobot.intake as intake_module
+from absorbobot.workers import progress as progress_module
 
 
 ADMIN, ALICE = 1, 2
@@ -624,3 +625,180 @@ def test_cancelled_external_worker_partial_is_removed_without_worker_result(env)
         assert store.get_draft(draft["id"])["status"] == "failed"
 
     asyncio.run(scenario())
+
+
+def _youtube_then_analyze(sandbox, *, youtube_value, analyze_value):
+    """Собрать подмену sandbox: фаза загрузки и фаза разбора из одного словаря."""
+
+    async def run(work_uuid, phase, argv, **kwargs):
+        root = sandbox._root(work_uuid)
+        if phase == "youtube":
+            media = root / "tmp" / "youtube-fake" / "media.mkv"
+            media.parent.mkdir(parents=True, exist_ok=True)
+            media.write_bytes(b"downloaded")
+            value = {"relative_path": str(media.relative_to(root)), **youtube_value}
+        else:
+            value = dict(analyze_value)
+            preview = value.get("preview_relative_path")
+            if isinstance(preview, str) and not preview.startswith(("/", "..")):
+                target = root / preview
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(b"\xff\xd8\xff" + b"x" * 64)
+        out = root / "tmp" / ("phase-" + phase + ".stdout")
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps({"ok": True, **value}), encoding="utf-8")
+        return {"exit_code": 0, "stdout_path": str(out), "stderr_path": str(out),
+                "resource_report": dict(FAKE_REPORT), "binding": {}}
+
+    sandbox.run = run
+
+
+def test_youtube_progress_and_title_reach_draft_during_await(env):
+    store, intake, sandbox = env
+    draft = store.create_draft(ALICE)
+    store.update_draft(ALICE, draft["id"], ui_state={"pending_import_ids": [MESSAGE_ID]})
+
+    async def scenario():
+        reached, gate = asyncio.Event(), asyncio.Event()
+
+        async def run(work_uuid, phase, argv, **kwargs):
+            root = sandbox._root(work_uuid)
+            if phase == "youtube":
+                progress_module.write_progress(root, "youtube", completed=1234, total=4096, unit="bytes")
+                reached.set()
+                await gate.wait()
+                media = root / "tmp" / "youtube-fake" / "media.mkv"
+                media.parent.mkdir(parents=True, exist_ok=True)
+                media.write_bytes(b"downloaded")
+                value = {"relative_path": "tmp/youtube-fake/media.mkv", "duration": 30.0,
+                         "title": "Lecture One"}
+            else:
+                value = {"duration": 30.0, "pages": None}
+            out = root / "tmp" / ("phase-" + phase + ".stdout")
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_text(json.dumps({"ok": True, **value}), encoding="utf-8")
+            return {"exit_code": 0, "stdout_path": str(out), "stderr_path": str(out),
+                    "resource_report": dict(FAKE_REPORT), "binding": {}}
+
+        sandbox.run = run
+        task = asyncio.create_task(intake.handle(payload(ALICE, draft["id"],
+                       text="https://youtu.be/abcdefghijk")))
+        await asyncio.wait_for(reached.wait(), 2)
+        observed = None
+        for _ in range(60):
+            observed = store.get_draft(draft["id"])["ui_state"].get("import_progress")
+            if observed and observed.get("completed") == 1234:
+                break
+            await asyncio.sleep(0.05)
+        assert observed["stage"] == "youtube" and observed["unit"] == "bytes"
+        assert observed["completed"] == 1234 and observed["total"] == 4096
+        gate.set()
+        return await task
+
+    result = asyncio.run(scenario())
+    assert result["status"] == "imported"
+    state = store.get_draft(draft["id"])["ui_state"]
+    # Фактический заголовок из метаданных, а не идентификатор видео.
+    assert state["title"] == "Lecture One"
+    assert store.files(draft["id"])[0]["original_name"] == "Lecture One.mkv"
+    assert state["import_progress"]["stage"] == "analyze"
+    assert not (store.settings.storage_dir / "jobs" / draft["id"] / "tmp" / "progress.youtube.json").exists()
+
+
+def test_cancelled_import_leaves_no_success_progress(env):
+    store, intake, sandbox = env
+    draft = store.create_draft(ALICE)
+    store.update_draft(ALICE, draft["id"], ui_state={"pending_import_ids": [MESSAGE_ID]})
+
+    async def scenario():
+        reached = asyncio.Event()
+
+        async def run(work_uuid, phase, argv, **kwargs):
+            progress_module.write_progress(sandbox._root(work_uuid), "youtube",
+                                           completed=10, total=100, unit="bytes")
+            reached.set()
+            await asyncio.Event().wait()
+
+        sandbox.run = run
+        task = asyncio.create_task(intake.handle(payload(ALICE, draft["id"],
+                       text="https://youtu.be/abcdefghijk")))
+        await asyncio.wait_for(reached.wait(), 2)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(scenario())
+    stored = store.get_draft(draft["id"])
+    assert stored["status"] == "failed"
+    assert "import_progress" not in stored["ui_state"]
+
+
+def test_analyze_preview_path_is_stored_for_accepted_media(env):
+    store, intake, sandbox = env
+    draft = store.create_draft(ALICE)
+    _youtube_then_analyze(
+        sandbox,
+        youtube_value={"duration": 30.0, "title": "Резервная копия"},
+        analyze_value={"duration": 30.0, "pages": None,
+                       "preview_relative_path": "tmp/analyze-x/preview.jpg",
+                       "preview_width": 320, "preview_height": 240})
+    result = asyncio.run(intake.handle(payload(ALICE, draft["id"], text="https://youtu.be/abcdefghijk")))
+    assert result["status"] == "imported"
+    state = store.get_draft(draft["id"])["ui_state"]
+    assert state["preview_relative_path"] == "tmp/analyze-x/preview.jpg"
+    assert state["title"] == "Резервная копия"
+
+
+@pytest.mark.parametrize("preview", ["../escape.jpg", "/tmp/escape.jpg", "input/escape.jpg"])
+def test_preview_path_outside_tmp_is_ignored(env, preview):
+    store, intake, sandbox = env
+    draft = store.create_draft(ALICE)
+    _youtube_then_analyze(
+        sandbox,
+        youtube_value={"duration": 30.0, "title": "T"},
+        analyze_value={"duration": 30.0, "pages": None,
+                       "preview_relative_path": preview,
+                       "preview_width": 320, "preview_height": 240})
+    result = asyncio.run(intake.handle(payload(ALICE, draft["id"], text="https://youtu.be/abcdefghijk")))
+    assert result["status"] == "imported"
+    assert "preview_relative_path" not in store.get_draft(draft["id"])["ui_state"]
+
+
+def test_lookup_youtube_metadata_stores_title_without_download(env):
+    store, intake, sandbox = env
+    draft = store.create_draft(ALICE)
+    calls = []
+
+    async def run(work_uuid, phase, argv, **kwargs):
+        calls.append((phase, list(argv)))
+        root = sandbox._root(work_uuid)
+        out = root / "tmp" / "meta.stdout"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps({"ok": True, "duration": 42.0, "title": "Recovered"}))
+        return {"exit_code": 0, "stdout_path": str(out), "stderr_path": str(out),
+                "resource_report": dict(FAKE_REPORT), "binding": {}}
+
+    sandbox.run = run
+    result = asyncio.run(intake.lookup_youtube_metadata(ALICE, draft["id"], "https://youtu.be/abcdefghijk"))
+    assert result == {"duration": 42.0, "title": "Recovered"}
+    assert store.get_draft(draft["id"])["ui_state"]["title"] == "Recovered"
+    assert calls[0][1][2] == "--metadata"
+    assert store.files(draft["id"]) == []
+
+
+def test_material_import_preserves_recording_title_and_preview(env):
+    store, intake, _ = env
+    draft = store.create_draft(ALICE)
+    asyncio.run(intake.handle(payload(ALICE, draft["id"],
+        document={"file_id": "recording", "file_size": 7, "file_name": "recording.m4a"})))
+    state = dict(store.get_draft(draft["id"])["ui_state"])
+    state.update(title="Consensus algorithms", preview_relative_path="tmp/source-preview.jpg")
+    store.update_draft(ALICE, draft["id"], ui_state=state)
+
+    result = asyncio.run(intake.handle(payload(ALICE, draft["id"], message_id=101,
+        document={"file_id": "slides", "file_size": 7, "file_name": "slides.pdf"})))
+
+    assert result["status"] == "imported"
+    current = store.get_draft(draft["id"])["ui_state"]
+    assert current["title"] == "Consensus algorithms"
+    assert current["preview_relative_path"] == "tmp/source-preview.jpg"

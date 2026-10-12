@@ -62,6 +62,19 @@ def normalize_youtube_url(value: str) -> str:
         raise YouTubeError("invalid_youtube_url") from None
 
 
+_TITLE_LIMIT = 300
+
+
+def clean_title(value) -> str | None:
+    """Оставить человекочитаемый заголовок без управляющих знаков или ``None``."""
+    if not isinstance(value, str):
+        return None
+    title = "".join(char for char in value if char >= " " and char != "\x7f").strip()
+    if not title:
+        return None
+    return title[:_TITLE_LIMIT]
+
+
 def validate_metadata(info: dict, video_id: str, max_seconds: float) -> dict:
     """Не начинать загрузку эфира, плейлиста или записи неизвестной длины."""
     if (not isinstance(info, dict) or info.get("_type", "video") != "video"
@@ -78,7 +91,12 @@ def validate_metadata(info: dict, video_id: str, max_seconds: float) -> dict:
         raise YouTubeError("invalid_duration")
     if duration > max_seconds:
         raise YouTubeError("media_too_long")
-    return {"duration": duration}
+    result = {"duration": duration}
+    title = clean_title(info.get("title"))
+    if title is not None:
+        # Заголовок берём из фактических метаданных, а не из идентификатора видео.
+        result["title"] = title
+    return result
 
 
 def tree_bytes(root: Path) -> int:
@@ -106,8 +124,9 @@ def tree_bytes(root: Path) -> int:
 class DownloadBudget:
     """Ограничить фактический поток, включая HTTP без Content-Length."""
 
-    def __init__(self, directory: Path, limit: int):
+    def __init__(self, directory: Path, limit: int, report=None):
         self.directory, self.limit = directory.resolve(), limit
+        self.report = report
         self.downloaded: dict[str, int] = {}
 
     def __call__(self, progress: dict) -> None:
@@ -119,6 +138,9 @@ class DownloadBudget:
             value = progress.get("downloaded_bytes")
             if type(value) is int and value >= 0:
                 self.downloaded[str(path)] = max(self.downloaded.get(str(path), 0), value)
+        if self.report is not None:
+            # Форматы видео и аудио приходят отдельно; их общий размер заранее неизвестен.
+            self.report(sum(self.downloaded.values()), None)
         if sum(self.downloaded.values()) > self.limit or tree_bytes(self.directory) > 2 * self.limit:
             raise YouTubeError("input_too_large")
 
@@ -135,6 +157,15 @@ class _QuietLogger:
         pass
 
 
+def _progress_module():
+    """Загрузить модуль прогресса и в пакете, и при запуске как скрипта."""
+    try:
+        from . import progress as module
+    except ImportError:
+        import progress as module  # type: ignore[no-redef]
+    return module
+
+
 def _download(video_id: str, mode: str, byte_limit: int, max_seconds: float,
               directory: Path) -> dict:
     from yt_dlp import YoutubeDL
@@ -144,7 +175,9 @@ def _download(video_id: str, mode: str, byte_limit: int, max_seconds: float,
     all_plugins_loaded.value = True
     from yt_dlp.extractor.youtube import YoutubeIE
 
-    budget = DownloadBudget(directory, byte_limit)
+    reporter = _progress_module().ProgressWriter(directory.parent.parent, "youtube", "bytes",
+                                                 min_interval=0.5)
+    budget = DownloadBudget(directory, byte_limit, report=reporter.update)
     options = {
         "quiet": True, "no_warnings": True, "logger": _QuietLogger(),
         "noplaylist": True, "cachedir": False, "cookiefile": None,
@@ -178,6 +211,30 @@ def _download(video_id: str, mode: str, byte_limit: int, max_seconds: float,
         raise YouTubeError("input_too_large")
     budget({})
     return {"relative_path": str(output.relative_to(directory.parent.parent)), **metadata}
+
+
+def lookup(video_id: str, max_seconds: float) -> dict:
+    """Прочитать метаданные записи без загрузки файла для восстановления подписи."""
+    if not VIDEO_ID.fullmatch(video_id):
+        raise YouTubeError("invalid_youtube_url")
+    from yt_dlp import YoutubeDL
+    from yt_dlp.globals import all_plugins_loaded, plugin_dirs
+    plugin_dirs.value = []
+    all_plugins_loaded.value = True
+    from yt_dlp.extractor.youtube import YoutubeIE
+
+    options = {
+        "quiet": True, "no_warnings": True, "logger": _QuietLogger(),
+        "noplaylist": True, "cachedir": False, "cookiefile": None,
+        "cookiesfrombrowser": None, "enable_file_urls": False,
+        "js_runtimes": {"bun": {"path": "/usr/bin/bun"}}, "remote_components": [],
+        "socket_timeout": 30, "retries": 3,
+    }
+    with YoutubeDL(options, auto_init=False) as downloader:
+        downloader.add_info_extractor(YoutubeIE())
+        info = downloader.extract_info("https://www.youtube.com/watch?v=" + video_id,
+                                       download=False, process=False)
+        return validate_metadata(info, video_id, max_seconds)
 
 
 def _stop_child(process: subprocess.Popen) -> None:
@@ -243,6 +300,10 @@ def download(video_id: str, mode: str, byte_limit: int, max_seconds: float,
         if not output.is_relative_to(directory) or output.stat().st_size > byte_limit:
             raise YouTubeError("input_too_large")
         return result
+    except BaseException:
+        # Неудачная загрузка не оставляет progress-файл стадии в дереве задания.
+        _progress_module().discard_progress(root, "youtube")
+        raise
     finally:
         # Не оставлять дочернюю extraction/merge после отказа guard или сигнала.
         _stop_child(process)
@@ -255,6 +316,15 @@ def _result_error(exc: Exception) -> dict:
 
 def main(argv: list[str] | None = None) -> int:
     args = sys.argv[1:] if argv is None else argv
+    if args and args[0] == "--metadata":
+        try:
+            if len(args) != 3:
+                raise YouTubeError("youtube_failed")
+            result = {"ok": True, **lookup(args[1], float(args[2]))}
+        except Exception as exc:
+            result = _result_error(exc)
+        print(json.dumps(result, allow_nan=False))
+        return 0 if result["ok"] else 2
     if args and args[0] == "--child":
         directory = Path(args[-1])
         try:

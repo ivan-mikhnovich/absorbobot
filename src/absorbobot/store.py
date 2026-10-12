@@ -945,16 +945,22 @@ class Store:
             self.db.execute("INSERT INTO durable_tokens(token,owner_id,action,target,payload,created_at) VALUES (?,?,?,?,?,?)", (token, owner_id, action, target, _json(payload or {}), _utc()))
             return token
 
+    def get_token(self, owner_id: int, token: str, action: str | None = None) -> dict:
+        """Прочитать собственную кнопку, включая уже выполненное действие."""
+        self._auth(owner_id)
+        row = self._one("SELECT * FROM durable_tokens WHERE token=?", (token,))
+        if not row or row["owner_id"] != owner_id or (action is not None and row["action"] != action):
+            raise StoreError("invalid_token")
+        return row
+
     def consume_token(self, owner_id: int, token: str, action: str | None = None) -> dict:
         with self.transaction():
-            self._auth(owner_id)
-            row = self._one("SELECT * FROM durable_tokens WHERE token=?", (token,))
-            if not row or row["owner_id"] != owner_id or (action is not None and row["action"] != action):
-                raise StoreError("invalid_token")
+            row = self.get_token(owner_id, token, action)
             if row["consumed_at"] is not None:
                 raise StoreError("token_consumed")
-            self._update("durable_tokens", token, {"consumed_at": _utc()}, pk="token")
-            row["consumed_at"] = self._one("SELECT consumed_at FROM durable_tokens WHERE token=?", (token,))["consumed_at"]
+            consumed_at = _utc()
+            self._update("durable_tokens", token, {"consumed_at": consumed_at}, pk="token")
+            row["consumed_at"] = consumed_at
             return row
 
     def offset(self) -> int:
