@@ -12,7 +12,7 @@ from pathlib import PurePath
 from .i18n import tr
 from .identity import work_title, work_preview
 from .store import StoreError, QuotaError
-from .workers.media import MediaError, normalize_media_url
+from .workers.media import MediaError, resolve_media_url
 from .workers.external import normalize_external_url
 
 
@@ -202,11 +202,10 @@ class Dialog:
         if draft['close_requested']:
             self._send(owner, tr(self._language(owner), 'dialog.preparing'))
             return
-        media, external = False, False
+        platform, external = None, False
         if message.get('text'):
             try:
-                normalize_media_url(message['text'])
-                media = True
+                platform, _, _ = resolve_media_url(message['text'])
             except MediaError:
                 try:
                     normalize_external_url(message['text'])
@@ -232,11 +231,14 @@ class Dialog:
             ids = list(draft['source_message_ids'])
             ids.append(message['message_id'])
             self.store.update_draft(owner, draft['id'], ui_state=state, source_message_id=message['message_id'], source_chat_id=owner, source_message_ids=ids)
-            if media:
+            if platform is not None and len(platform.modes) > 1:
                 state['media_pending'] = source
                 self.store.update_draft(owner, draft['id'], ui_state=state)
                 self._send(owner, tr(self._language(owner), 'dialog.media_mode'), [[self._button(owner, 'button.video', 'media', draft['id'], {'mode': 'video'}), self._button(owner, 'button.audio_only', 'media', draft['id'], {'mode': 'audio'})]])
                 return
+            if platform is not None:
+                # Площадка отдаёт записи только одного вида: спрашивать нечего.
+                source = {**source, 'media_mode': next(iter(platform.modes))}
         else:
             ids = list(draft['source_message_ids'])
             ids.append(message['message_id'])

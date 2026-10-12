@@ -432,6 +432,20 @@ def test_handle_media_import_keeps_ready_and_records_mode(env, link, mode, canon
     assert sandbox.runs[0]["argv"][3] == mode
 
 
+def test_handle_audio_only_platform_forces_audio_mode(env):
+    store, intake, sandbox = env
+    draft = store.create_draft(ALICE)
+    result = asyncio.run(intake.handle(payload(
+        ALICE, draft["id"], text="https://soundcloud.com/ethmusic/lostin-powers-she-so-heavy",
+        media_mode="video")))
+    assert result["status"] == "imported"
+    files = store.files(draft["id"])
+    # Площадка отдаёт только звук, поэтому режим видео к ней не применяется.
+    assert files[0]["original_name"] == "SoundCloud ethmusic/lostin-powers-she-so-heavy.m4a"
+    assert sandbox.runs[0]["argv"][2] == "https://soundcloud.com/ethmusic/lostin-powers-she-so-heavy"
+    assert sandbox.runs[0]["argv"][3] == "audio"
+
+
 def test_later_material_import_survives_private_sandbox_runtime_links(env):
     store, intake, _ = env
     draft = store.create_draft(ALICE)

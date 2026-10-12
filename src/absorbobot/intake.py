@@ -21,7 +21,7 @@ from .config import ConfigError, check_storage, create_work_tree
 from .i18n import tr
 from .metrics import aggregate_reports
 from .store import StoreError, utc_now
-from .workers.media import MediaError, normalize_media_url, placeholder_name, tree_bytes
+from .workers.media import MediaError, normalize_media_url, placeholder_name, resolve_media_url, tree_bytes
 from .workers.external import normalize_external_url
 from .workers.progress import ProgressWriter, read_progress, discard_progress
 
@@ -645,16 +645,17 @@ class Intake:
                 return {"status": "imported", "file_id": existing["id"], "duplicate": True}
             if message.get("text"):
                 try:
-                    url = normalize_media_url(message["text"])
+                    platform, url, _ = resolve_media_url(message["text"])
                     media = True
                 except MediaError:
                     url = normalize_external_url(message["text"])
                     external = True
             if media:
-                mode = message.get("media_mode", payload.get("media_mode", draft["settings"].get("media_mode", "video")))
-                if mode not in ("video", "audio"):
-                    raise IntakeError("invalid_media_url")
-                extension = ".mkv" if mode == "video" else ".m4a"
+                mode = message.get("media_mode", payload.get("media_mode", draft["settings"].get("media_mode")))
+                if mode not in platform.modes:
+                    # У звуковой площадки единственный режим, иначе порядок таблицы.
+                    mode = next(iter(platform.modes))
+                extension = platform.modes[mode].extension
                 if extension not in _extensions(self.core["media_extensions"]):
                     raise IntakeError("unsupported_input")
                 descriptor = {"role": "media", "bytes": 0, "extension": extension,

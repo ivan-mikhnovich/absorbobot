@@ -313,6 +313,17 @@ def test_media_preparation_waits_for_explicit_mode_and_keeps_minimal_source(dial
     assert payload['message']['chat']['id'] == ALICE
 
 
+def test_audio_only_platform_queues_import_without_mode_question(dialog, store):
+    dialog.handle_message(message(text='/new'))
+    store.active_draft(ALICE)
+    dialog.handle_message(message(text='https://soundcloud.com/ethmusic/lostin-powers-she-so-heavy'))
+    # Вопрос о режиме не задаётся: у SoundCloud записи только звуковые.
+    assert not tokens(store, 'media')
+    payload = outbox(store, 'intake')[-1]['payload']
+    assert payload['message']['media_mode'] == 'audio'
+    assert not store.files(payload['draft_id'])
+
+
 def test_cancel_affects_only_confirmed_own_set_and_preserves_binding(dialog, store):
     own = accepted(dialog, store)
     foreign = accepted(dialog, store, BOB, sha='c' * 64)
