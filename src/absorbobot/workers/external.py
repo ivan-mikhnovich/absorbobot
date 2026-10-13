@@ -34,11 +34,13 @@ class ExternalError(ValueError):
 _SAFE_CODES = frozenset({
     "invalid_url", "unsafe_url", "invalid_file_metadata", "unsupported_input",
     "input_too_large", "download_failed", "timeout", "work_limit",
-    "storage_unavailable", "unsafe_file_path",
+    "storage_unavailable", "unsafe_file_path", "link_requires_signin",
 })
 
 _YANDEX_HOSTS = frozenset({"disk.yandex.ru", "disk.yandex.com", "yadi.sk"})
 _GOOGLE_HOSTS = frozenset({"drive.google.com", "drive.usercontent.google.com"})
+# Узлы, куда Google уводит анонимный запрос к закрытому файлу.
+_GOOGLE_ACCOUNTS_HOSTS = frozenset({"accounts.google.com"})
 
 _YANDEX_API = "https://cloud-api.yandex.net/v1/disk/public/resources"
 _YANDEX_KEY = re.compile(r"[A-Za-z0-9_-]{3,200}")
@@ -249,6 +251,31 @@ def parse_google_confirmation(html: bytes | str, expected_id: str) -> str:
         query = urlencode([(name, fields[name]) for name in _GOOGLE_FORM_FIELDS if name in fields])
         return "https://" + _GOOGLE_CONFIRM_HOST + _GOOGLE_CONFIRM_PATH + "?" + query
     raise ExternalError("unsupported_input")
+
+
+def _signin_redirect(response) -> bool:
+    """Понять по итоговому адресу, что Google увёл запрос на страницу входа."""
+    url = getattr(response, "url", None)
+    if url is None:
+        return False
+    try:
+        return urlsplit(str(url)).hostname in _GOOGLE_ACCOUNTS_HOSTS
+    except ValueError:
+        return False
+
+
+async def _read_confirmation(transport, response) -> bytes:
+    """Прочитать страницу подтверждения, не путая её размер с размером входа.
+
+    Предел ``_HTML_LIMIT`` относится к служебной странице, а не к файлу: его
+    превышение означает, что Google отдал страницу входа или защиты, а не файл.
+    """
+    try:
+        return await transport.read_small(response, _HTML_LIMIT)
+    except Exception as exc:
+        if getattr(exc, "code", None) == "input_too_large":
+            raise ExternalError("link_requires_signin") from None
+        raise
 
 
 def safe_basename(value) -> str:
@@ -473,14 +500,18 @@ async def _run(url: str, tmp: Path, root: Path, media: set[str], material: set[s
             target = url
         response = await stack.enter_async_context(client.open(target))
         content_type = _header(response, "Content-Type").split(";")[0].strip().lower()
+        if google_id and _signin_redirect(response):
+            raise ExternalError("link_requires_signin")
         if google_id and content_type == "text/html":
-            body = await transport.read_small(response, _HTML_LIMIT)
+            body = await _read_confirmation(transport, response)
             confirm_url = parse_google_confirmation(body, google_id)
             resourcekey = dict(parse_qsl(urlsplit(target).query)).get("resourcekey")
             if resourcekey:
                 confirm_url += "&" + urlencode({"resourcekey": resourcekey})
             response = await stack.enter_async_context(client.open(confirm_url))
             content_type = _header(response, "Content-Type").split(";")[0].strip().lower()
+            if _signin_redirect(response):
+                raise ExternalError("link_requires_signin")
             if content_type == "text/html":
                 raise ExternalError("unsupported_input")
         if content_type in ("text/html", "application/xhtml+xml"):

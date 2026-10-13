@@ -339,7 +339,7 @@ _ERROR_CODES = frozenset({
     "missing_audio", "invalid_material", "material_pages_exceeded", "analysis_failed",
     "invalid_media_url", "invalid_media_metadata", "media_live", "media_unavailable",
     "media_failed", "telegram_file_unavailable", "media_exists", "source_first",
-    "invalid_url", "unsafe_url", "download_failed", "telegram_file_too_large",
+    "invalid_url", "unsafe_url", "download_failed", "telegram_file_too_large", "link_requires_signin",
     "cancelled", "timeout", "sandbox_unavailable", "handshake_failed", "invalid_runtime",
     "interrupted",
 })

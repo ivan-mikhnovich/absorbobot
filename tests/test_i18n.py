@@ -2,7 +2,7 @@
 
 import pytest
 
-from absorbobot.i18n import language_for, notes_language, tr
+from absorbobot.i18n import catalogues, language_for, notes_language, tr
 
 
 @pytest.mark.parametrize("code, expected", [(None, "en"), ("ru", "ru"), ("ru-RU", "ru"),
@@ -31,3 +31,11 @@ def test_full_installed_revision_is_not_truncated_in_version_message(language):
     text = tr(language, "version", version="0.1.2", commit=revision, bot_version="0.1.0")
     assert revision in text
     assert "0.1.2" in text
+
+
+def test_every_intake_error_code_has_a_message():
+    """Код отказа без подписи уронил бы задание на месте (как подпись стадии в 0.5.1)."""
+    from absorbobot.intake import _ERROR_CODES
+    messages = catalogues()["ru"]
+    for code in sorted(_ERROR_CODES):
+        assert messages.get("intake.error." + code)

@@ -302,6 +302,7 @@
   "intake.error.invalid_url": "Send a valid public HTTP(S) link to one file without a username or password.",
   "intake.error.unsafe_url": "The link was rejected: its address or redirect violates the security policy.",
   "intake.error.download_failed": "Could not download the public file. Check that it is accessible without authentication and send the link again.",
+  "intake.error.link_requires_signin": "Google did not return the file without an account sign-in. Open access to “anyone with the link” and send the link again.",
   "intake.error.work_limit": "Working files exceeded the allowed size. Processing was stopped.",
   "intake.error.storage_unavailable": "Storage is unavailable: the disk is unmounted, full or read-only. Intake is stopped.",
   "intake.error.unsafe_file_path": "The file path is unsafe; import rejected.",

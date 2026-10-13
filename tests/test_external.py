@@ -54,10 +54,12 @@ class _Content:
 
 
 class _Response:
-    def __init__(self, chunks: list[bytes], headers: dict | None = None, status: int = 200):
+    def __init__(self, chunks: list[bytes], headers: dict | None = None, status: int = 200,
+                 url: str = ""):
         self.headers = _Headers(headers or {})
         self.content = _Content(chunks)
         self.status = status
+        self.url = url
         self.content_length = sum(len(chunk) for chunk in chunks)
 
     def close(self) -> None:
@@ -458,6 +460,54 @@ def test_parse_google_confirmation_rejects_untrusted(html, expected_id, code):
     with pytest.raises(ExternalError) as error:
         parse_google_confirmation(html, expected_id)
     assert str(error.value) == code
+
+
+SIGNIN_URL = ("https://accounts.google.com/v3/signin/identifier?"
+              "continue=https://drive.usercontent.google.com/download")
+
+
+def google_routes(file_id, *responses):
+    first = ("https://drive.usercontent.google.com/download?"
+             + urlencode({"id": file_id, "export": "download"}))
+    return {first: list(responses)}
+
+
+def test_fetch_google_signin_page_is_reported_as_signin(tmp_path):
+    """Закрытый файл: Google уводит на вход, а не отдаёт файл."""
+    file_id = "1AbCdEfGhIjKlMnOpQrStUvWx"
+    routes = google_routes(file_id, _Response([b"<html><body>sign in</body></html>"],
+                                              {"Content-Type": "text/html; charset=utf-8"}, url=SIGNIN_URL))
+    with pytest.raises(ExternalError) as error:
+        run(request(url=f"https://drive.google.com/file/d/{file_id}/view"), routes, tmp_path)
+    assert str(error.value) == "link_requires_signin"
+
+
+def test_fetch_google_oversized_login_page_is_not_file_size(tmp_path):
+    """Размер служебной страницы входа не описывает входной файл."""
+    file_id = "1AbCdEfGhIjKlMnOpQrStUvWx"
+    page = b"<html><body>" + b"x" * (external._HTML_LIMIT + 1) + b"</body></html>"
+    routes = google_routes(file_id, _Response([page], {"Content-Type": "text/html; charset=utf-8"}))
+    with pytest.raises(ExternalError) as error:
+        run(request(url=f"https://drive.google.com/file/d/{file_id}/view"), routes, tmp_path)
+    assert str(error.value) == "link_requires_signin"
+
+
+def test_fetch_google_signin_after_confirmation_is_reported_as_signin(tmp_path):
+    """Даже после формы подтверждения Google может увести на вход."""
+    file_id = "1AbCdEfGhIjKlMnOpQrStUvWx"
+    confirm = ("https://drive.usercontent.google.com/download?"
+               + urlencode({"id": file_id, "export": "download", "confirm": "t", "uuid": "u-1"}))
+    html = (f'<html><body><form action="https://drive.usercontent.google.com/download" method="get">'
+            f'<input type="hidden" name="id" value="{file_id}">'
+            f'<input type="hidden" name="export" value="download">'
+            f'<input type="hidden" name="confirm" value="t">'
+            f'<input type="hidden" name="uuid" value="u-1"></form></body></html>')
+    routes = {**google_routes(file_id, _Response([html.encode()], {"Content-Type": "text/html"})),
+              confirm: [_Response([b"<html><body>sign in</body></html>"],
+                                  {"Content-Type": "text/html"}, url=SIGNIN_URL)]}
+    with pytest.raises(ExternalError) as error:
+        run(request(url=f"https://drive.google.com/file/d/{file_id}/view"), routes, tmp_path)
+    assert str(error.value) == "link_requires_signin"
 
 
 def test_fetch_rejects_missing_extension_lists(tmp_path):

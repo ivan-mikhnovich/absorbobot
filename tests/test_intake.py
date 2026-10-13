@@ -286,6 +286,7 @@ class FakeSandbox:
         self.runs = []
         self.cancelled = []
         self.fail_phase = None
+        self.fail_code = "analysis_failed"
         self.blocked_phase = None
 
     def _root(self, work_uuid):
@@ -303,12 +304,12 @@ class FakeSandbox:
             media.parent.mkdir(parents=True, exist_ok=True)
             media.write_bytes(b"downloaded")
             value = {"ok": True, "relative_path": str(media.relative_to(root)), "duration": 30.0}
-        elif argv[3] == "media":
+        elif len(argv) > 3 and argv[3] == "media":
             value = {"ok": True, "duration": 12.5, "pages": None}
         else:
             value = {"ok": True, "duration": None, "pages": 2}
         if phase == self.fail_phase:
-            value = {"ok": False, "error": "analysis_failed"}
+            value = {"ok": False, "error": self.fail_code}
         out = root / "tmp" / "phase.stdout"
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(json.dumps(value), encoding="utf-8")
@@ -562,6 +563,27 @@ def test_failed_analysis_keeps_measured_preparation_and_clears_pending(env):
     assert operations[1]["resources"]["phase_id"] == "input_analyze"
     assert stored["ui_state"]["pending_import_ids"] == []
     assert store.files(draft["id"]) == []
+
+
+def test_external_signin_page_reaches_the_user_as_signin_not_size(env):
+    """Закрытая ссылка Google: причина отказа — вход, а не размер файла."""
+    store, intake, sandbox = env
+    sandbox.fail_phase, sandbox.fail_code = "external", "link_requires_signin"
+    draft = store.create_draft(ALICE)
+    store.update_draft(ALICE, draft["id"], ui_state={"pending_import_ids": [MESSAGE_ID]})
+    result = asyncio.run(intake.handle(payload(ALICE, draft["id"],
+                         text="https://drive.google.com/file/d/1AbCdEfGhIjKlMnOpQrStUvWx/view")))
+    assert result["status"] == "rejected" and result["reason"] == "link_requires_signin"
+    stored = store.get_draft(draft["id"])
+    assert stored["failure_reason"] == "link_requires_signin"
+    assert stored["status"] == "collecting"
+    assert any(row["payload"]["kwargs"].get("text") == "intake.error.link_requires_signin"
+               for row in store.pending_outbox(limit=100))
+
+
+def test_worker_safe_codes_are_known_to_intake():
+    from absorbobot.workers.external import _SAFE_CODES
+    assert _SAFE_CODES <= intake_module._ERROR_CODES
 
 
 def test_cancelled_import_keeps_measured_preparation(env):
