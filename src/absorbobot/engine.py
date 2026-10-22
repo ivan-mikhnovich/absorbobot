@@ -21,7 +21,8 @@ from absorbobot.identity import work_title
 from absorbobot.intake import Intake
 from absorbobot.metrics import JournalIngestor, PhaseMetrics, aggregate_reports
 from absorbobot.pricing import Pricing
-from absorbobot.reporting import TERMINAL_STAGES, progress_line
+from absorbobot.reporting import (REPORT_ORDER, TERMINAL_STAGES, progress_import,
+                                  progress_report, stage_key)
 from absorbobot.sandbox import Sandbox, SandboxError
 from absorbobot.store import StoreError, TERMINAL_JOBS, utc_now
 
@@ -133,11 +134,6 @@ class Engine:
                 actions = self._domain_outbox()
                 for queued in self.store.jobs(statuses=["queued"], limit=1000):
                     self._progress_action(queued, "status.queued")
-                for item in actions:
-                    if item["kind"] == "intake" and item["payload"]["draft_id"] != self._active_uuid:
-                        draft = self.store.get_draft(item["payload"]["draft_id"])
-                        if draft and not draft["close_requested"] and draft["status"] in ("collecting", "ready"):
-                            self._progress_action(draft, "input.queued")
                 for item in actions:
                     if item["kind"] == "cancel_work":
                         await self._cancel(item["payload"])
@@ -297,57 +293,90 @@ class Engine:
                 argv += ["--slides", "/work/" + file["relative_path"]]
         return argv
 
-    def _progress_action(self, job, stage, *, final=False, detail=None):
+    PROGRESS_INTERVAL_SECONDS = 5
+
+    @staticmethod
+    def _finished_row(state: dict) -> dict:
+        """Строка уже завершённого этапа для нового отчёта."""
+        return {"started": state["started"], "ended": state["started"],
+                "status": "done", "detail": None, "synthetic": True}
+
+    def _progress_action(self, job, stage, *, final=False, detail=None, ended=None):
         now = time.monotonic()
-        previous = self._progress.get(job["id"], {})
-        changed = stage != previous.get("stage")
-        started = now if changed else previous.get("started", now)
-        self._progress[job["id"]] = previous = {**previous, "stage": stage, "started": started,
-                                               "detail": detail, "pending": stage}
-        if not final and now - previous.get("last", -10) < 5:
+        state = self._progress.setdefault(job["id"], {
+            "started": now, "last": float("-inf"), "rows": {}, "stage": None})
+        if stage in TERMINAL_STAGES:
+            # Живой отчёт нужен только пока идёт работа: итог и причину присылают отдельно.
+            self._drop_progress(job["owner_id"], job["id"])
+            self._progress.pop(job["id"], None)
+            return
+        key = stage_key(stage)
+        if key == "input":
+            row = state["rows"].setdefault("input", {"started": now, "detail": None,
+                                                     "status": "active"})
+            row["status"] = "active"
+            if isinstance(detail, dict):
+                row["detail"] = detail
+        elif key in REPORT_ORDER:
+            row = state["rows"].setdefault(key, {"started": now, "detail": None, "status": "pending"})
+            if ended is not None:
+                # Окончание этапа фиксирует его исход, а не текущую стадию отчёта.
+                row["status"] = {"skipped": "skipped", "ok": "done"}.get(ended, "failed")
+                row["ended"] = now
+                if state.get("stage") == stage:
+                    state["stage"] = None
+            else:
+                if row["status"] not in ("done", "skipped", "failed"):
+                    row["status"] = "active"
+                if isinstance(detail, dict):
+                    row["detail"] = detail
+                elif stage != state.get("stage"):
+                    row["detail"] = None
+                state["stage"] = stage
+        if key == "delivery":
+            # Выдача начинается только после готового конвейера: прошлые строки уже пройдены.
+            for name in REPORT_ORDER:
+                if name != "delivery":
+                    state["rows"].setdefault(name, self._finished_row(state))
+        if not final and now - state["last"] < self.PROGRESS_INTERVAL_SECONDS:
             return
         owner = job["owner_id"]
         user = self.store.get_user(owner)
         if not user or not self.store.authorized(owner):
             return
-        if stage in TERMINAL_STAGES:
-            # Живой отчёт нужен только пока идёт работа: итог и причину присылают отдельно.
-            self._drop_progress(owner, job["id"])
-            self._progress.pop(job["id"], None)
-            return
-        markdown, text = progress_line(user["language"], stage, detail=detail,
-                                       elapsed=None if final else int(now - started))
-        outbox_id = previous.get("outbox_id")
-        sent = self.store.db.execute("SELECT result FROM outbox WHERE id=? AND status='sent'", (outbox_id,)).fetchone() if outbox_id else None
-        message_id = json.loads(sent["result"] or "{}").get("message_id") if sent else None
-        if message_id:
-            self.store.add_outbox("telegram", {"owner_id": owner, "method": "edit_message_text",
-                "purpose": "progress", "work_uuid": job["id"], "text": text,
-                "kwargs": {"chat_id": owner, "message_id": message_id, "rich_message": {"markdown": markdown}}})
-        elif not outbox_id:
-            outbox_id = self.store.add_outbox("telegram", {"owner_id": owner, "method": "send_rich_message",
-                "purpose": "progress", "work_uuid": job["id"], "text": text,
-                "kwargs": {"chat_id": owner, "rich_message": {"markdown": markdown}, "reply_parameters": {
-                    "message_id": job["source_message_id"], "allow_sending_without_reply": True}}})
+        if key == "input":
+            row = state["rows"].get("input") or {"started": now, "detail": None}
+            rich, text = progress_import(user["language"], row.get("detail"),
+                                         int(now - row["started"]))
         else:
-            with self.store.transaction():
-                pending = self.store.db.execute(
-                    "SELECT payload FROM outbox WHERE id=? AND kind='telegram' AND status='pending'",
-                    (outbox_id,),
-                ).fetchone()
-                if pending:
-                    payload = json.loads(pending["payload"])
-                    if (payload.get("owner_id") != owner
-                            or payload.get("work_uuid") != job["id"]
-                            or payload.get("purpose") != "progress"):
-                        raise StoreError("progress_conflict")
-                    payload["kwargs"]["rich_message"] = {"markdown": markdown}
-                    payload["text"] = text
-                    self.store.db.execute(
-                        "UPDATE outbox SET payload=? WHERE id=? AND status='pending'",
-                        (json.dumps(payload, ensure_ascii=False, allow_nan=False), outbox_id),
-                    )
-        self._progress[job["id"]] = {**previous, "last": now, "outbox_id": outbox_id, "pending": None}
+            rows = {}
+            for name in REPORT_ORDER:
+                row = state["rows"].get(name)
+                if row is None:
+                    rows[name] = {"status": "pending", "detail": None, "elapsed": 0}
+                else:
+                    rows[name] = {"status": row["status"], "detail": row.get("detail"),
+                                  "elapsed": None if row.get("synthetic")
+                                  else int(row.get("ended", now) - row["started"])}
+            rich, text = progress_report(user["language"], work_title(self.store, job), rows,
+                                         elapsed=int(now - state["started"]))
+        action = {"owner_id": owner, "purpose": "progress", "work_uuid": job["id"], "text": text}
+        message_id = self.store.progress_message_id(job["id"])
+        if message_id is not None:
+            action.update({"method": "edit_message_text", "kwargs": {
+                "chat_id": owner, "message_id": message_id, "rich_message": rich}})
+        else:
+            # Отчёт уже удалён или сдвинут: прежняя строка не цель для правки, нужен новый.
+            action.update({"method": "send_rich_message", "kwargs": {
+                "chat_id": owner, "rich_message": rich, "reply_parameters": {
+                    "message_id": job["source_message_id"], "allow_sending_without_reply": True}}})
+        pending = next((row for row in self.store.progress_actions(job["id"])
+                        if row["status"] == "pending"), None)
+        if pending is not None:
+            self.store.update_outbox_payload(pending["id"], action)
+        else:
+            self.store.add_outbox("telegram", action)
+        state["last"] = now
 
     def _drop_progress(self, owner: int, work_uuid: str) -> None:
         """Убрать сообщение живого отчёта: в чате остаются результат и причина отказа."""
@@ -384,6 +413,23 @@ class Engine:
                 }
         return events
 
+    def _apply_event(self, job, event):
+        """Применить событие журнала ядра к строкам живого отчёта.
+
+        Этап ``render`` ядро проходит вхолостую: бот запускает его с
+        ``--skip-render`` и собирает HTML и PDF сам, поэтому событие ядра не
+        должно помечать строку «Не потребовалось».
+        """
+        stage, event_name = event.get("stage"), event.get("event")
+        if not stage or stage == "render":
+            return
+        if event_name == "stage_start":
+            self._progress_action(job, "stage." + stage)
+        elif event_name == "stage_progress":
+            self._progress_action(job, "stage." + stage, detail=event)
+        elif event_name == "stage_end":
+            self._progress_action(job, "stage." + stage, ended=event.get("status"))
+
     @staticmethod
     def _resources(reports: list[dict]) -> dict:
         """Свод фаз и полные отчёты: причина GPU и наблюдения чужих устройств не теряются."""
@@ -410,11 +456,7 @@ class Engine:
                     while not task.done():
                         events = self._journal(job, ingestor, tree / "events.jsonl", metrics)
                         for event in events:
-                            stage, event_name = event.get("stage"), event.get("event")
-                            if event_name == "stage_start" and stage:
-                                self._progress_action(job, "stage." + stage)
-                            elif event_name == "stage_progress" and stage:
-                                self._progress_action(job, "stage." + stage, detail=event)
+                            self._apply_event(job, event)
                         previous = self._progress.get(job["id"], {})
                         if previous.get("stage"):
                             self._progress_action(job, previous["stage"], detail=previous.get("detail"))
@@ -479,6 +521,8 @@ class Engine:
                     "/workers/render.py", "/work/output/notes.md", job["snapshot"]["settings"]["output_language"]]
             await self._phase(job, "render", argv, core, ingestor, reports, metrics, deadline, network=False)
             metrics["render_seconds"] = time.monotonic() - rendering
+            # Ядро не рендерило (--skip-render): исход строки принадлежит боту.
+            self._progress_action(job, "stage.render", ended="ok")
             self._progress_action(job, "stage.package")
             packaging = asyncio.create_task(asyncio.to_thread(package_result, tree))
             try:

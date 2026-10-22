@@ -223,8 +223,22 @@ def test_engine_adds_input_preparation_and_persists_full_phase_reports(state, mo
     assert reports[1]['shared_device_observations'][0]['gpu_utilization'] == 70
 
 
-def test_live_report_is_rich_and_removed_when_work_finishes(state):
-    """Живой отчёт одной строкой, а по завершении его убирают вместе с несделанной правкой."""
+def report_text(payload):
+    """Плоский текст rich-таблицы: ячейки, подписи и запасные глифы эмодзи."""
+    def walk(value):
+        if isinstance(value, str):
+            return value + " "
+        if isinstance(value, list):
+            return "".join(walk(item) for item in value)
+        if isinstance(value, dict):
+            return "".join(walk(item) for item in value.values())
+        return ""
+    blocks = payload["kwargs"]["rich_message"]["blocks"]
+    return walk(blocks)
+
+
+def test_import_report_is_a_line_and_removed_when_work_finishes(state):
+    """Приём файла идёт отдельной строкой, а по завершении её убирают вместе с правкой."""
     store, engine, _ = state
     draft = store.create_draft(2, source_message_id=123)
     engine._progress_action(draft, "input.external",
@@ -234,10 +248,13 @@ def test_live_report_is_rich_and_removed_when_work_finishes(state):
     assert len(actions) == 1
     payload = actions[0]["payload"]
     assert payload["method"] == "send_rich_message"
-    markdown = payload["kwargs"]["rich_message"]["markdown"]
-    assert "tg://emoji?id=6096080291347042802" in markdown
-    assert "`▮▮▮▯▯▯▯▯▯▯▯▯`" in markdown and "27 %" in markdown and "13.7 / 51.0 MB" in markdown
-    assert payload["text"].startswith("📥 Fetching the file · ▮▮▮▯")
+    blocks = payload["kwargs"]["rich_message"]["blocks"]
+    assert len(blocks) == 1 and blocks[0]["type"] == "paragraph"
+    text = report_text(payload)
+    assert "6096080291347042802" in json.dumps(payload, ensure_ascii=False)
+    assert "▮▮▯▯▯▯▯▯" in text and "27 %" in text and "13.7 / 51.0 MB" in text
+    assert "Fetching the file" in text
+    assert payload["text"].startswith("📥 Fetching the file")
 
     store.outbox_sent(actions[0]["id"], {"message_id": 900, "progress": True})
     engine._progress_action(draft, "input.ready", final=True)
@@ -264,22 +281,105 @@ def test_live_report_rewrites_the_pending_action(state):
     actions = [row for row in store.pending_outbox(100)
                if row["payload"].get("purpose") == "progress"]
     assert len(actions) == 1
-    markdown = actions[0]["payload"]["kwargs"]["rich_message"]["markdown"]
-    assert "75 %" in markdown and "`▮▮▮▮▮▮▮▮▮▯▯▯`" in markdown
-    assert "300.0 / 400.0 s of recording" in markdown
+    text = report_text(actions[0]["payload"])
+    assert "75 %" in text and "▮▮▮▮▮▮▯▯" in text
+    assert "300 / 400 s" in text
 
 
-def test_pending_intake_of_collecting_draft_gets_queued_stage(state):
-    """Ожидающий импорт другой лекции показывает стадию ожидания.
+def test_live_report_restarts_after_its_message_is_dropped(state):
+    """Удалённый или сдвинутый отчёт не правится в пустоту: ставится новый.
 
-    Подпись стадии и её знак обязаны быть в каталоге и в отчёте: прежде
-    пропущенный `input.queued` ронял службу в цикл перезапусков.
+    Прежде движок запоминал идентификатор действия и после переноса отчёта
+    продолжал править уже отправленную строку без ``message_id``, поэтому
+    подробности загрузки замирали на первом обновлении.
+    """
+    store, engine, _ = state
+    draft = store.create_draft(2, source_message_id=123)
+    detail = {"completed": 8_000_000, "total": None, "unit": "bytes"}
+    engine._progress_action(draft, "input.media", detail=detail)
+    first = next(row for row in store.pending_outbox(100)
+                 if row["payload"].get("purpose") == "progress")
+    store.outbox_sent(first["id"], {"message_id": 900, "progress": True})
+    # Отчёт убран из чата: живого сообщения больше нет.
+    store.forget_progress_message(draft["id"], 900, "report_moved")
+    engine._progress[draft["id"]]["last"] -= 10
+    engine._progress_action(draft, "input.media",
+                            detail={**detail, "completed": 16_000_000})
+    actions = [row for row in store.pending_outbox(100)
+               if row["payload"].get("purpose") == "progress"]
+    assert len(actions) == 1
+    payload = actions[0]["payload"]
+    assert payload["method"] == "send_rich_message"
+    assert "16.0 MB" in report_text(payload)
+
+
+def test_report_splits_frame_extraction_and_description(state):
+    """Нарезка кадров и их описание — соседние строки с общим знаком."""
+    store, engine, _ = state
+    draft = store.create_draft(2, source_message_id=123)
+    engine._progress_action(draft, "stage.describe_keyframes",
+                            detail={"completed": 2, "total": 5, "unit": "images"})
+    payload = next(row for row in store.pending_outbox(100)
+                   if row["payload"].get("purpose") == "progress")["payload"]
+    blocks = payload["kwargs"]["rich_message"]["blocks"]
+    assert blocks[1]["type"] == "table" and len(blocks[1]["cells"]) == 9
+    text = report_text(payload)
+    assert "Frame extraction" in text
+    assert "Frame description" in text
+    assert "40 %" in text
+    # Приём файла в таблицу обработки не входит.
+    assert "Fetching the file" not in text
+    engine._progress[draft["id"]]["last"] -= 10
+    engine._progress_action(draft, "stage.extract_frames", ended="ok")
+    payload = next(row for row in store.pending_outbox(100)
+                   if row["payload"].get("purpose") == "progress")["payload"]
+    text = report_text(payload)
+    # Нарезка завершена, а описание всё ещё идёт своей полосой.
+    assert "Frame extraction" in text and "100 %" in text
+
+
+def test_delivery_report_shows_finished_pipeline(state):
+    """Перед выдачей готовые этапы не выглядят ожидающими."""
+    store, engine, _ = state
+    draft = store.create_draft(2, source_message_id=123)
+    engine._progress_action(draft, "stage.delivery",
+                            detail={"completed": 1, "total": 4, "unit": "items"})
+    payload = next(row for row in store.pending_outbox(100)
+                   if row["payload"].get("purpose") == "progress")["payload"]
+    text = report_text(payload)
+    assert "Telegram upload" in text and "25 %" in text
+    assert text.count("100 %") >= 7
+
+
+def test_report_keeps_parallel_stage_bars(state):
+    """Параллельные этапы видны одновременно и обновляются независимо."""
+    store, engine, _ = state
+    draft = store.create_draft(2, source_message_id=123)
+    engine._progress_action(draft, "stage.stt",
+                            detail={"completed": 100.0, "total": 400.0, "unit": "seconds"})
+    engine._progress[draft["id"]]["last"] -= 10
+    engine._progress_action(draft, "stage.extract_frames",
+                            detail={"completed": 3, "total": 12, "unit": "frames"})
+    payload = next(row for row in store.pending_outbox(100)
+                   if row["payload"].get("purpose") == "progress")["payload"]
+    text = report_text(payload)
+    assert "Speech recognition" in text and "25 %" in text
+    assert "Frame extraction" in text and "25 %" in text
+    assert "3 / 12 frames" in text
+    assert "Fetching the file" not in text
+
+
+def test_pending_intake_does_not_preempt_its_notice(state):
+    """Ожидающий импорт не ставит отчёт раньше уведомления «Принял запись».
+
+    Прежде цикл движка сразу показывал «Приём файла · 0 с», а уведомление о
+    приёме ложилось следом, и отчёт приходилось удалять и переносить вниз.
     """
     store, engine, _ = state
     draft = store.create_draft(2, source_message_id=123)
     store.add_outbox("intake", {"owner_id": 2, "draft_id": draft["id"],
                                 "message": {"message_id": 123, "chat": {"id": 2}}})
-    # Пауза не даёт движку начать импорт: проверяется только сообщение о стадии.
+    # Пауза не даёт движку начать импорт: отчёта до уведомления быть не должно.
     store.set_paused(1, True)
     stop = asyncio.Event()
 
@@ -289,18 +389,29 @@ def test_pending_intake_of_collecting_draft_gets_queued_stage(state):
 
     async def scenario():
         task = asyncio.create_task(engine.run(stop))
-        for _ in range(50):
+        for _ in range(20):
             await asyncio.sleep(0.05)
-            if progress_actions():
-                break
         stop.set()
         await task
 
     asyncio.run(scenario())
-    actions = progress_actions()
-    assert actions, "ожидающая стадия обязана попасть в живой отчёт"
-    payload = actions[0]["payload"]
-    assert payload["method"] == "send_rich_message"
-    markdown = payload["kwargs"]["rich_message"]["markdown"]
-    assert "tg://emoji?id=6096080291347042802" in markdown and "Fetching the file" in markdown
-    assert payload["text"].startswith("📥 Fetching the file")
+    assert progress_actions() == []
+
+
+def test_core_render_skip_does_not_mark_bot_render(state):
+    """Пропуск render ядром не делает строку «Не потребовалось»: рендерит бот."""
+    store, engine, _ = state
+    draft = store.create_draft(2, source_message_id=123)
+    engine._progress_action(draft, "stage.render")
+    payload = next(row for row in store.pending_outbox(100)
+                   if row["payload"].get("purpose") == "progress")["payload"]
+    assert "HTML and PDF" in report_text(payload)
+    engine._apply_event(draft, {"event": "stage_end", "stage": "render", "status": "skipped"})
+    assert "Not needed" not in report_text(payload)
+    # Собственная фаза рендера завершает строку успешно.
+    engine._progress[draft["id"]]["last"] -= 10
+    engine._progress_action(draft, "stage.render", ended="ok")
+    payload = next(row for row in store.pending_outbox(100)
+                   if row["payload"].get("purpose") == "progress")["payload"]
+    assert "100 %" in report_text(payload)
+
