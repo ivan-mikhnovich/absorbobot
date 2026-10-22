@@ -516,3 +516,24 @@ def test_engine_starts_manual_diagnosis_from_outbox(state):
     asyncio.run(scenario())
     assert started == [incident["id"]]
     assert not [row for row in store.pending_outbox(100) if row["kind"] == "diagnose"]
+
+
+def test_internal_intake_failure_starts_diagnosis(state):
+    store, engine, _ = state
+    draft = store.create_draft(2, source_message_id=123)
+    item_id = store.add_outbox("intake", {"owner_id": 2, "draft_id": draft["id"],
+                                          "message": {"message_id": 123}})
+    item = {"id": item_id, "payload": {"owner_id": 2, "draft_id": draft["id"],
+                                       "message": {"message_id": 123}}}
+    calls = []
+
+    async def failed(payload):
+        return {"status": "rejected", "reason": "sandbox_unavailable"}
+
+    async def recorded(owner, draft_id, code, *, context=None):
+        calls.append((owner, draft_id, code))
+
+    engine.intake.handle = failed
+    engine.incidents.intake_failure = recorded
+    asyncio.run(engine._import(item))
+    assert calls == [(2, draft["id"], "sandbox_unavailable")]

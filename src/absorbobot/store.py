@@ -33,6 +33,10 @@ INTERNAL_FAILURES = RETRYABLE_FAILURES | frozenset({
     "sandbox_unavailable", "handshake_failed", "invalid_runtime",
     "unsafe_work_tree", "uv_unavailable", "cleanup_failed", "work_limit",
 })
+INTAKE_INTERNAL_FAILURES = frozenset({
+    "sandbox_unavailable", "handshake_failed", "invalid_runtime",
+    "storage_unavailable", "analysis_failed",
+})
 JOB_TRANSITIONS = {
     "queued": {"preparing", "cancelled", "failed"},
     "preparing": {"running", "awaiting_reuse_choice", "cancel_requested", "failed"},
@@ -766,7 +770,7 @@ class Store:
                      context: dict[str, Any] | None = None, cooldown_seconds: int = 1800,
                      user_notified: bool = False) -> tuple[dict[str, Any], bool]:
         """Записать инцидент, подавив повтор той же причины в пределах паузы."""
-        if kind not in ("job", "service", "manual"):
+        if kind not in ("job", "service", "manual", "intake"):
             raise StoreError("invalid_incident_kind")
         if not isinstance(fingerprint, str) or not fingerprint or len(fingerprint) > 200:
             raise StoreError("invalid_fingerprint")

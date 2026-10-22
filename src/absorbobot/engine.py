@@ -25,7 +25,8 @@ from absorbobot.pricing import Pricing
 from absorbobot.reporting import (REPORT_ORDER, TERMINAL_STAGES, progress_import,
                                   progress_report, stage_key)
 from absorbobot.sandbox import Sandbox, SandboxError
-from absorbobot.store import INTERNAL_FAILURES, RETRYABLE_FAILURES, StoreError, TERMINAL_JOBS, utc_now
+from absorbobot.store import (INTERNAL_FAILURES, INTAKE_INTERNAL_FAILURES, RETRYABLE_FAILURES,
+                              StoreError, TERMINAL_JOBS, utc_now)
 
 
 class Engine:
@@ -306,6 +307,15 @@ class Engine:
             if draft:
                 stage = "input.ready" if result.get("status") == "imported" else "input.failed"
                 self._progress_action(draft, stage, final=True)
+                if result.get("status") == "rejected" and result.get("reason") in INTAKE_INTERNAL_FAILURES:
+                    try:
+                        await self.incidents.intake_failure(
+                            payload["owner_id"], payload["draft_id"], result["reason"],
+                            context={"message_id": payload["message"]["message_id"],
+                                     "work_tree": str(self.settings.storage_dir / "jobs" / payload["draft_id"])},
+                        )
+                    except Exception:
+                        self._administrator_error(payload["draft_id"], "diagnose_unavailable")
             self.store.outbox_sent(item["id"], result)
 
     def _delivery_progress(self):
@@ -585,6 +595,7 @@ class Engine:
 
     async def _process(self, job):
         started = time.monotonic()
+        self._stall_handled.discard(job["id"])
         self._touch()
         metrics = deepcopy(job["metrics"])
         deadline = started + self.settings.max_processing_seconds

@@ -20,7 +20,8 @@ from aiogram.types import FSInputFile
 
 from .config import Settings, load_secrets
 from .i18n import tr
-from .store import INTERNAL_FAILURES, RETRYABLE_FAILURES, Store, StoreError, utc_now
+from .store import (INTERNAL_FAILURES, INTAKE_INTERNAL_FAILURES, RETRYABLE_FAILURES,
+                    Store, StoreError, utc_now)
 
 
 MODEL = "deepseek/deepseek-flash"
@@ -135,6 +136,21 @@ class IncidentManager:
         await self._prepare_and_start(incident, context or {})
         return self.store.get_incident(incident["id"])
 
+    async def intake_failure(self, owner_id: int, draft_id: str, code: str,
+                             *, context: dict | None = None) -> dict | None:
+        """Диагностика внутреннего сбоя приёма: пользователь уже получил отказ."""
+        if code not in INTAKE_INTERNAL_FAILURES:
+            return None
+        payload = {"draft_id": draft_id, "owner_id": owner_id, "code": code, **(context or {})}
+        incident, created = self.store.add_incident(
+            "intake", f"intake:{code}", context=payload,
+            cooldown_seconds=COOLDOWN_SECONDS, user_notified=True,
+        )
+        if not created:
+            return incident
+        await self._prepare_and_start(incident, payload)
+        return self.store.get_incident(incident["id"])
+
     async def service_failure(self, *, start: bool = True) -> dict:
         context = self._service_context()
         incident, created = self.store.add_incident(
@@ -172,6 +188,7 @@ class IncidentManager:
         except (OSError, ValueError, StoreError) as exc:
             self.store.update_incident(incident["id"], status="failed",
                                        error=f"prompt_failed:{type(exc).__name__}")
+            self._start_failed(incident)
             return
         await self._start(incident)
 
@@ -240,6 +257,7 @@ class IncidentManager:
         except (OSError, ValueError, StoreError) as exc:
             self.store.update_incident(incident["id"], status="failed",
                                        error=f"prompt_failed:{type(exc).__name__}")
+            self._start_failed(incident)
             return
         await self._start(incident)
 

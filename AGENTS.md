@@ -81,7 +81,9 @@ systemctl --user restart absorbobot.service
 - Внутренние ошибки задания перечислены в `INTERNAL_FAILURES`
   ([`store.py`](src/absorbobot/store.py)); для них движок создаёт запись в
   `incidents` и запускает `absorbobot-diagnose@<id>.service`. Пользовательские
-  отказы и отмены диагноста не запускают.
+  отказы и отмены диагноста не запускают. Внутренние сбои импорта
+  (`INTAKE_INTERNAL_FAILURES`) ловит [`Engine::_import()`](src/absorbobot/engine.py)
+  и передаёт в [`IncidentManager::intake_failure()`](src/absorbobot/incident.py).
 - [`IncidentManager`](src/absorbobot/incident.py) пишет промпт и запускает
   отдельный unit через `systemctl --user`; сам бот не ждёт агента. Повторный
   сбой с той же причиной в течение 30 минут подавляется.
