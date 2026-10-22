@@ -95,3 +95,7 @@ systemctl --user restart absorbobot.service
 - Кнопка «Повторить» использует [`Store::retry_job()`](src/absorbobot/store.py)
   и [`reset_work_tree()`](src/absorbobot/config.py): вход сохраняется,
   результаты прошлого запуска удаляются.
+- Команда администратора `/fix <комментарий>` создаёт инцидент вида `manual`
+  и кладёт в outbox действие `diagnose`; движок вызывает
+  [`IncidentManager::start_manual()`](src/absorbobot/incident.py), поэтому
+  запуск unit не выполняется внутри транзакции обработки update.

@@ -184,9 +184,12 @@ class Engine:
         self._drop_progress(job["owner_id"], job_id)
         self._notice(job["owner_id"], job_id, "engine.system_failure",
                      source=job.get("source_message_id"), dedupe=f"stalled:{job_id}")
-        await self.incidents.job_failure(job, "stalled", context=context, user_notified=True)
         if self._active_uuid == job_id and self._active is not None and not self._active.done():
             self._active.cancel()
+        try:
+            await self.incidents.job_failure(job, "stalled", context=context, user_notified=True)
+        except Exception:
+            self._administrator_error(job_id, "diagnose_unavailable")
 
     async def _watchdog(self, stop) -> None:
         """Сторож зависаний: 15 минут без событий задания считаются сбоем."""
@@ -205,13 +208,13 @@ class Engine:
             if time.monotonic() - self._activity >= JOB_STALL_SECONDS:
                 try:
                     await self._stall(job_id)
-                except (StoreError, OSError):
+                except Exception:
                     continue
 
     def _domain_outbox(self):
         rows = self.store.db.execute(
             "SELECT * FROM outbox WHERE status='pending' AND available_at<=? "
-            "AND kind IN ('intake','delivery','cancel_work') ORDER BY id LIMIT 100",
+            "AND kind IN ('intake','delivery','cancel_work','diagnose') ORDER BY id LIMIT 100",
             (utc_now().isoformat(),),
         ).fetchall()
         return [{**dict(row), "payload": json.loads(row["payload"])} for row in rows]
@@ -231,6 +234,13 @@ class Engine:
                         self.store.outbox_sent(item["id"], {"stopped": True})
                     elif item["kind"] == "delivery" and item["id"] not in self._delivery_tasks:
                         self._delivery_tasks[item["id"]] = asyncio.create_task(self._deliver(item))
+                    elif item["kind"] == "diagnose":
+                        try:
+                            await self.incidents.start_manual(item["payload"]["incident_id"])
+                        except Exception as exc:
+                            self.store.outbox_sent(item["id"], {"error": type(exc).__name__})
+                        else:
+                            self.store.outbox_sent(item["id"], {"started": True})
                 for key, task in list(self._delivery_tasks.items()):
                     if task.done():
                         await task
@@ -670,7 +680,10 @@ class Engine:
                         context = self._failure_context(job, code=code)
                         self._notice(job["owner_id"], job["id"], "engine.system_failure",
                                      source=job["source_message_id"], dedupe=f"failed:{job['id']}")
-                        await self.incidents.job_failure(job, code, context=context, user_notified=True)
+                        try:
+                            await self.incidents.job_failure(job, code, context=context, user_notified=True)
+                        except Exception:
+                            self._administrator_error(job["id"], "diagnose_unavailable")
                     else:
                         self._notice(job["owner_id"], job["id"], "engine.failed", source=job["source_message_id"],
                                      dedupe=f"failed:{job['id']}")

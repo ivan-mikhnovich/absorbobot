@@ -379,3 +379,23 @@ def test_allow_invalid_username_is_reported_without_side_effects(admin, store):
     assert store.db.execute("SELECT COUNT(*) FROM access_requests").fetchone()[0] == 0
     assert store.get_user(7) is None
     assert outgoing(store, ADMIN)
+
+
+def test_fix_command_queues_manual_diagnosis(admin, store):
+    assert admin.handle_message(message("/fix Почему последнее задание не выполняется?"))
+    rows = store.db.execute("SELECT * FROM incidents WHERE kind='manual'").fetchall()
+    assert len(rows) == 1
+    incident = store.get_incident(rows[0]["id"])
+    assert incident["context"]["comment"] == "Почему последнее задание не выполняется?"
+    assert incident["context"]["admin_id"] == ADMIN
+    actions = [row for row in store.pending_outbox(100) if row["kind"] == "diagnose"]
+    assert actions and actions[0]["payload"]["incident_id"] == incident["id"]
+    texts = [row["payload"]["kwargs"]["text"] for row in outgoing(store, ADMIN)]
+    assert any("diagnos" in text.lower() for text in texts)
+
+
+def test_fix_command_requires_comment(admin, store):
+    assert admin.handle_message(message("/fix"))
+    assert not store.db.execute("SELECT id FROM incidents").fetchall()
+    texts = [row["payload"]["kwargs"]["text"] for row in outgoing(store, ADMIN)]
+    assert any("/fix" in text for text in texts)

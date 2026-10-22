@@ -6,7 +6,7 @@ import json
 import os
 import re
 from pathlib import Path
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from .i18n import tr
 from .identity import work_title
@@ -14,7 +14,7 @@ from .store import StoreError, TERMINAL_JOBS, utc_now
 
 
 PAGE_SIZE = 10
-COMMANDS = {"admin", "queue", "allow", "ban", "users", "job", "stats", "storage", "purge", "pause", "resume"}
+COMMANDS = {"admin", "queue", "allow", "ban", "users", "job", "stats", "storage", "purge", "pause", "resume", "fix"}
 QUEUE_STATUSES = ("queued", "preparing", "running", "cancel_requested", "awaiting_reuse_choice")
 
 
@@ -170,6 +170,8 @@ class Admin:
                         self._job(actor, target)
                 elif command == "stats":
                     self._stats(actor, _user_id(argument) if argument else None)
+                elif command == "fix":
+                    self._fix(actor, argument)
                 else:
                     if argument:
                         raise StoreError("invalid_arguments")
@@ -210,6 +212,22 @@ class Admin:
             except StoreError as error:
                 self._error(actor, error)
         return True
+
+    def _fix(self, actor: int, comment: str):
+        """Явно запустить аварийную диагностику с комментарием администратора."""
+        comment = comment.strip()
+        if not comment:
+            self._send(actor, self._t(actor, "fix_usage"))
+            return
+        if len(comment) > 2000:
+            raise StoreError("invalid_arguments")
+        incident, _ = self.store.add_incident(
+            "manual", f"manual:{uuid4()}", context={"admin_id": actor, "comment": comment},
+            cooldown_seconds=0,
+        )
+        self.store.add_outbox("diagnose", {"incident_id": incident["id"]},
+                              dedupe_key=f"diagnose:{incident['id']}")
+        self._send(actor, self._t(actor, "fix_started", id=incident["id"]))
 
     def _error(self, actor: int, error: StoreError):
         known = {"cannot_ban_admin", "not_found", "work_active", "invalid_uuid", "invalid_user_id", "invalid_username", "invalid_arguments", "purge_failed", "safe_purge_unavailable"}

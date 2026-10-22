@@ -491,3 +491,28 @@ def test_stalled_job_is_failed_and_diagnosed(state):
     failed = store.get_job(job["id"])
     assert failed["status"] == "failed" and failed["failure_reason"] == "stalled"
     assert calls == [(job["id"], "stalled", True)]
+
+
+def test_engine_starts_manual_diagnosis_from_outbox(state):
+    store, engine, _ = state
+    incident, _ = store.add_incident("manual", "manual:test", context={"comment": "check"})
+    store.add_outbox("diagnose", {"incident_id": incident["id"]})
+    store.set_paused(1, True)
+    started = []
+
+    async def recorded(incident_id):
+        started.append(incident_id)
+
+    engine.incidents.start_manual = recorded
+    stop = asyncio.Event()
+
+    async def scenario():
+        task = asyncio.create_task(engine.run(stop))
+        for _ in range(20):
+            await asyncio.sleep(0.05)
+        stop.set()
+        await task
+
+    asyncio.run(scenario())
+    assert started == [incident["id"]]
+    assert not [row for row in store.pending_outbox(100) if row["kind"] == "diagnose"]

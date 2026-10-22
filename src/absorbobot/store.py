@@ -766,7 +766,7 @@ class Store:
                      context: dict[str, Any] | None = None, cooldown_seconds: int = 1800,
                      user_notified: bool = False) -> tuple[dict[str, Any], bool]:
         """Записать инцидент, подавив повтор той же причины в пределах паузы."""
-        if kind not in ("job", "service"):
+        if kind not in ("job", "service", "manual"):
             raise StoreError("invalid_incident_kind")
         if not isinstance(fingerprint, str) or not fingerprint or len(fingerprint) > 200:
             raise StoreError("invalid_fingerprint")
@@ -821,6 +821,8 @@ class Store:
         with self.transaction():
             job = self._owned("jobs", owner_id, job_id)
             if job["status"] != "failed" or job["failure_reason"] not in RETRYABLE_FAILURES:
+                raise StoreError("retry_unavailable")
+            if job["files_deleted"]:
                 raise StoreError("retry_unavailable")
             if self._bound(job_id):
                 raise StoreError("process_bound")

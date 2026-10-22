@@ -171,6 +171,7 @@
   "error.paused": "The server is paused. New preparation will resume after an administrator resumes it.",
   "error.execution_busy": "Another preparation or job is active. Please wait.",
   "error.stale": "This action is no longer available. Reopen /settings or /jobs.",
+  "error.retry_unavailable": "Retry failed: the job has changed or its files were deleted.",
   "error.unsupported_input": "Send a recording, material or public file link (Yandex Disk, Google Drive, direct HTTP(S)); a single public platform recording (YouTube, VK Video, Rutube, Dzen and others) is also supported. Commands, local paths and private files are not accepted.",
   "value.auto": "Automatic",
   "value.ru": "Russian",
@@ -195,7 +196,7 @@
   "admin_confirm": "Confirm",
   "admin_paused": "new work paused",
   "admin_resumed": "processing enabled",
-  "admin_overview": "Administration\nAbsorbent {version}\nCommit: {commit}\nState: {state}\n\n/allow <user_id|@username|t.me/username> [label]\n/ban <numeric_user_id>\n/job <UUID>\n/stats [numeric_user_id]\n/purge <UUID>\n\nFIFO is shared; administrators bypass only the daily quota. Software upgrades are not available through Telegram.",
+  "admin_overview": "Administration\nAbsorbent {version}\nCommit: {commit}\nState: {state}\n\n/allow <user_id|@username|t.me/username> [label]\n/ban <numeric_user_id>\n/job <UUID>\n/stats [numeric_user_id]\n/purge <UUID>\n/fix <comment>\n\nFIFO is shared; administrators bypass only the daily quota. Software upgrades are not available through Telegram.",
   "admin_pause_notice": "Pause saved. No new preparation or jobs will start; current work is allowed to finish.",
   "admin_resume_notice": "Pause cleared. Preparation and jobs may continue in the shared FIFO queue.",
   "admin_allowed": "Access allowed for user {target}.",
@@ -343,5 +344,8 @@
   "incident_admin_launch": "The Absorbobot diagnostic agent has started.\nIncident: {id}\nReason: {reason}\nModel: {model}\nThe full report will follow in a separate message.",
   "incident_admin_report": "Diagnosis finished.\nIncident: {id}\nStatus: {status}\n\n{summary}",
   "incident_report_file": "Full agent report",
+  "incident_admin_start_failed": "Failed to start the diagnostic agent for incident {id}. See the service journal for details.",
+  "admin_fix_started": "Emergency diagnosis started: incident {id}. The report will arrive in this chat.",
+  "admin_fix_usage": "Usage: /fix <what to check>. The comment is passed to the agent's task.",
   "button.retry": "Retry"
 }

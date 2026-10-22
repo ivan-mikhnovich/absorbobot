@@ -147,6 +147,34 @@ class IncidentManager:
                 await self._start(incident)
         return incident
 
+    async def start_manual(self, incident_id: str) -> None:
+        """Подготовить и запустить инцидент, созданный командой /fix."""
+        incident = self.store.get_incident(incident_id)
+        if incident is None or incident["status"] != "queued":
+            return
+        context = dict(incident.get("context") or {})
+        try:
+            status = subprocess.run(
+                ["systemctl", "--user", "show", "absorbobot.service", "-p", "ActiveState", "-p", "NRestarts"],
+                capture_output=True, text=True, timeout=10, check=False,
+            ).stdout.strip()
+        except (OSError, subprocess.SubprocessError):
+            status = ""
+        context.update({
+            "manual": True,
+            "service_status": status,
+            "deployment_file": str(self.settings.state_dir / "deployment.json"),
+            "state_dir": str(self.settings.state_dir),
+            "storage_dir": str(self.settings.storage_dir),
+        })
+        try:
+            self._prepare(incident, context)
+        except (OSError, ValueError, StoreError) as exc:
+            self.store.update_incident(incident["id"], status="failed",
+                                       error=f"prompt_failed:{type(exc).__name__}")
+            return
+        await self._start(incident)
+
     def _service_context(self) -> dict:
         """Снимок службы и затронутых заданий для промпта агента."""
         cutoff = (utc_now() - timedelta(minutes=10)).isoformat(timespec="microseconds")
@@ -191,16 +219,34 @@ class IncidentManager:
         try:
             await asyncio.to_thread(self._start_unit, incident["id"])
         except (OSError, subprocess.SubprocessError, StoreError) as exc:
-            self.store.update_incident(incident["id"], status="failed", error=f"diagnose_start_failed:{type(exc).__name__}")
+            detail = " ".join(str(exc).split())[:300]
+            self.store.update_incident(incident["id"], status="failed",
+                                       error=f"diagnose_start_failed:{type(exc).__name__}:{detail}")
+            self._start_failed(incident)
+
+    def _start_failed(self, incident: dict) -> None:
+        for admin in self.settings.admin_ids:
+            user = self.store.get_user(admin)
+            language = (user or {}).get("language", "ru")
+            text = tr(language, "incident_admin_start_failed", id=incident["id"])
+            self.store.add_outbox("telegram", {
+                "owner_id": admin, "method": "send_message",
+                "kwargs": {"chat_id": admin, "text": text},
+            }, dedupe_key=f"diagnose-start-failed:{incident['id']}:{admin}")
 
     async def _prepare_and_start(self, incident: dict, context: dict) -> None:
-        self._prepare(incident, context)
+        try:
+            self._prepare(incident, context)
+        except (OSError, ValueError, StoreError) as exc:
+            self.store.update_incident(incident["id"], status="failed",
+                                       error=f"prompt_failed:{type(exc).__name__}")
+            return
         await self._start(incident)
 
     @staticmethod
     def _start_unit(incident_id: str) -> None:
         run = subprocess.run(
-            ["systemctl", "--user", "start", f"absorbobot-diagnose@{incident_id}.service"],
+            ["systemctl", "--user", "start", "--no-block", f"absorbobot-diagnose@{incident_id}.service"],
             capture_output=True, text=True, timeout=20, check=False,
         )
         if run.returncode:
