@@ -164,15 +164,21 @@ def _work_bytes(root: Path, limit: int) -> int:
     total = 0
     directories = [root]
     while directories:
-        with os.scandir(directories.pop()) as entries:
+        try:
+            entries = os.scandir(directories.pop())
+        except (FileNotFoundError, NotADirectoryError):
+            # Каталог исчез между обходом и чтением: рабочие каталоги uv и
+            # рендера живут недолго, и это не отказ хранилища.
+            continue
+        with entries:
             for entry in entries:
                 try:
                     info = entry.stat(follow_symlinks=False)
-                    total += info.st_size
-                    if stat.S_ISDIR(info.st_mode):
-                        directories.append(Path(entry.path))
-                except FileNotFoundError:
+                except (FileNotFoundError, NotADirectoryError):
                     continue
+                total += info.st_size
+                if stat.S_ISDIR(info.st_mode):
+                    directories.append(Path(entry.path))
                 if total > limit:
                     return total
     return total

@@ -350,7 +350,23 @@ def test_work_bytes_counts_and_stops(tmp_path):
     assert sandbox._work_bytes(root, 1) > 1
 
 
-def test_resource_report_keeps_only_public_schema(settings, store, tmp_path):
+def test_work_bytes_survives_vanishing_directories(tmp_path, monkeypatch):
+    """Каталог, исчезнувший во время обхода, — не отказ хранилища."""
+    root = tmp_path / "root"
+    (root / "gone").mkdir(parents=True)
+    (root / "file.bin").write_bytes(b"x" * 7)
+    real = os.scandir
+
+    def flaky(path):
+        if Path(path) == root / "gone":
+            raise FileNotFoundError(path)
+        return real(path)
+
+    monkeypatch.setattr(sandbox.os, "scandir", flaky)
+    assert sandbox._work_bytes(root, 10 ** 9) >= 7
+
+
+
     box = make_box(settings, store)
     root = tmp_path / "root"
     resources = root / "tmp" / "resources"
