@@ -109,6 +109,32 @@ def test_changed_core_fails_before_any_api_or_outputs(state, monkeypatch):
     assert not (store.settings.storage_dir / 'jobs' / job['id'] / 'config.yaml').exists()
 
 
+def test_failed_job_removes_live_report_before_failure_notice(state, monkeypatch):
+    """Упавшее задание не оставляет таблицу после сообщения об ошибке."""
+    store, engine, core = state
+    job = accepted(store, core)
+    store.claim_next(utc_now())
+    engine._progress_action(job, "stage.render")
+    sent = next(row for row in store.pending_outbox(100)
+                if row["payload"].get("purpose") == "progress")
+    store.outbox_sent(sent["id"], {"message_id": 700, "progress": True})
+    engine._progress[job["id"]]["last"] -= 10
+    engine._progress_action(job, "stage.render")
+
+    async def failed_run(work_uuid, phase, argv, **kwargs):
+        raise engine_module.SandboxError("storage_unavailable")
+
+    monkeypatch.setattr('absorbobot.engine.probe_core', lambda settings: core)
+    monkeypatch.setattr(engine.sandbox, "run", failed_run)
+    asyncio.run(engine._process(job))
+    assert store.get_job(job["id"])["failure_reason"] == "storage_unavailable"
+    rows = [row["payload"] for row in store.pending_outbox(100)]
+    assert not [row for row in rows if row.get("purpose") == "progress"]
+    drops = [row for row in rows if row.get("method") == "delete_message"]
+    assert [row["kwargs"]["message_id"] for row in drops] == [700]
+    assert any(row.get("method") == "send_message" for row in rows)
+
+
 def test_late_completed_reuse_releases_executor_not_reserved_quota(state, monkeypatch):
     store, engine, core = state
     original = accepted(store, core, owner=3)

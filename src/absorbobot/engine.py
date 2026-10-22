@@ -543,6 +543,7 @@ class Engine:
             current = self.store.get_job(job["id"])
             if current["status"] not in TERMINAL_JOBS:
                 cancelled = current["status"] == "cancel_requested"
+                self._drop_progress(job["owner_id"], job["id"])
                 self.store.update_job(job["id"], status="cancelled" if cancelled else "failed",
                                       failure_reason=None if cancelled else "interrupted",
                                       metrics=metrics, resources=self._resources(reports))
@@ -557,6 +558,7 @@ class Engine:
             current = self.store.get_job(job["id"])
             if current["status"] not in TERMINAL_JOBS:
                 code = getattr(exc, "code", "storage_unavailable" if isinstance(exc, ConfigError) else "processing_failed")
+                self._drop_progress(job["owner_id"], job["id"])
                 if current["status"] == "cancel_requested":
                     self.store.update_job(job["id"], status="cancelled", metrics=metrics,
                                           resources=self._resources(reports))
