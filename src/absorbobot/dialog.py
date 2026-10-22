@@ -9,9 +9,10 @@ import json
 import math
 from pathlib import PurePath
 
+from .config import ConfigError, reset_work_tree
 from .i18n import tr
 from .identity import work_title, work_preview
-from .store import StoreError, QuotaError
+from .store import RETRYABLE_FAILURES, StoreError, QuotaError
 from .workers.media import MediaError, resolve_media_url
 from .workers.external import normalize_external_url
 
@@ -20,7 +21,7 @@ COMMANDS = ('start', 'new', 'jobs', 'settings', 'language', 'help', 'cancel', 's
 NUMBERS = ('fps', 'hash_threshold', 'min_scene_seconds', 'slides_dpi')
 CATEGORIES = ('stt', 'vision', 'llm')
 UNFINISHED = ['queued', 'preparing', 'running', 'awaiting_reuse_choice', 'cancel_requested']
-ACTIONS = {'nav', 'lang', 'new_confirm', 'files_added', 'advanced', 'choose', 'set', 'number', 'reset', 'summary', 'submit', 'reuse', 'force_new', 'late_reuse', 'late_force', 'history', 'redeliver', 'cancel_confirm', 'media', 'materials'}
+ACTIONS = {'nav', 'lang', 'new_confirm', 'files_added', 'advanced', 'choose', 'set', 'number', 'reset', 'summary', 'submit', 'reuse', 'force_new', 'late_reuse', 'late_force', 'history', 'redeliver', 'cancel_confirm', 'media', 'materials', 'retry'}
 
 
 def now_utc():
@@ -690,5 +691,15 @@ class Dialog:
                     self.store.get_draft(work, owner)
             self.store.record_delivery(owner, source, work_uuid=work, now_utc=now_utc())
             self._delivery(owner, source, work)
+        elif action == 'retry':
+            job = self.store.get_job(target, owner)
+            if not job or job['status'] != 'failed' or job['failure_reason'] not in RETRYABLE_FAILURES:
+                raise StoreError('retry_unavailable')
+            try:
+                reset_work_tree(self.settings, job['id'])
+            except (ConfigError, OSError):
+                raise StoreError('retry_unavailable') from None
+            job = self.store.retry_job(owner, job['id'], now_utc())
+            self._accepted(owner, job)
         elif action == 'cancel_confirm':
             self._cancel(owner, payload)

@@ -135,6 +135,30 @@ def test_failed_job_removes_live_report_before_failure_notice(state, monkeypatch
     assert any(row.get("method") == "send_message" for row in rows)
 
 
+def test_internal_failure_starts_diagnosis_and_generic_notice(state, monkeypatch):
+    store, engine, core = state
+    job = accepted(store, core)
+    store.claim_next(utc_now())
+    calls = []
+
+    async def recorded(work, code, *, context=None, user_notified=False):
+        calls.append((work["id"], code, context, user_notified))
+
+    engine.incidents.job_failure = recorded
+
+    async def failed_run(work_uuid, phase, argv, **kwargs):
+        raise engine_module.SandboxError("storage_unavailable")
+
+    monkeypatch.setattr('absorbobot.engine.probe_core', lambda settings: core)
+    monkeypatch.setattr(engine.sandbox, "run", failed_run)
+    asyncio.run(engine._process(job))
+    assert store.get_job(job["id"])["failure_reason"] == "storage_unavailable"
+    assert calls and calls[0][1] == "storage_unavailable" and calls[0][3] is True
+    messages = [row["payload"]["kwargs"]["text"] for row in store.pending_outbox(100)
+                if row["payload"].get("method") == "send_message"]
+    assert any("failure" in text.lower() for text in messages)
+
+
 def test_late_completed_reuse_releases_executor_not_reserved_quota(state, monkeypatch):
     store, engine, core = state
     original = accepted(store, core, owner=3)
@@ -441,3 +465,29 @@ def test_core_render_skip_does_not_mark_bot_render(state):
                    if row["payload"].get("purpose") == "progress")["payload"]
     assert "100 %" in report_text(payload)
 
+
+
+def test_stalled_job_is_failed_and_diagnosed(state):
+    store, engine, core = state
+    job = accepted(store, core)
+    store.claim_next(utc_now())
+    store.update_job(job["id"], status="running")
+    calls = []
+
+    async def recorded(work, code, *, context=None, user_notified=False):
+        calls.append((work["id"], code, user_notified))
+
+    engine.incidents.job_failure = recorded
+
+    async def scenario():
+        engine._active_uuid = job["id"]
+        engine._active_kind = "job"
+        engine._active = asyncio.create_task(asyncio.Event().wait())
+        await engine._stall(job["id"])
+        with pytest.raises(asyncio.CancelledError):
+            await engine._active
+
+    asyncio.run(scenario())
+    failed = store.get_job(job["id"])
+    assert failed["status"] == "failed" and failed["failure_reason"] == "stalled"
+    assert calls == [(job["id"], "stalled", True)]

@@ -24,6 +24,15 @@ if TYPE_CHECKING:
 Job = dict[str, Any]
 ACTIVE_DRAFTS = ("collecting", "preparing", "ready")
 TERMINAL_JOBS = ("cancelled", "completed", "reused", "failed")
+RETRYABLE_FAILURES = frozenset({
+    "processing_failed", "render_failed", "storage_unavailable",
+    "journal_persistence_failed", "journal_invalid", "stalled", "interrupted",
+})
+INTERNAL_FAILURES = RETRYABLE_FAILURES | frozenset({
+    "core_changed", "models_changed", "output_not_fresh", "timeout",
+    "sandbox_unavailable", "handshake_failed", "invalid_runtime",
+    "unsafe_work_tree", "uv_unavailable", "cleanup_failed", "work_limit",
+})
 JOB_TRANSITIONS = {
     "queued": {"preparing", "cancelled", "failed"},
     "preparing": {"running", "awaiting_reuse_choice", "cancel_requested", "failed"},
@@ -43,7 +52,7 @@ DRAFT_TRANSITIONS = {
 JSON_FIELDS = {
     "settings", "ui_state", "snapshot", "models", "source_message_ids", "metrics",
     "resources", "binding", "payload", "result", "event_start", "event_end",
-    "cost_snapshot", "document",
+    "cost_snapshot", "document", "context",
 }
 _SECRET_FIELDS = {
     "api_key", "token", "password", "authorization", "secret", "secrets",
@@ -146,6 +155,15 @@ CREATE TABLE IF NOT EXISTS store_settings (
 CREATE TABLE IF NOT EXISTS chat_tails (
     chat_id INTEGER PRIMARY KEY, last_message_id INTEGER NOT NULL, updated_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS incidents (
+    id TEXT PRIMARY KEY, kind TEXT NOT NULL, fingerprint TEXT NOT NULL,
+    job_id TEXT, status TEXT NOT NULL, created_at TEXT NOT NULL,
+    started_at TEXT, finished_at TEXT, context TEXT NOT NULL DEFAULT '{}',
+    prompt_path TEXT, report_path TEXT, output_path TEXT, model TEXT,
+    exit_code INTEGER, error TEXT, user_notified INTEGER NOT NULL DEFAULT 0,
+    admins_notified INTEGER NOT NULL DEFAULT 0, retry_offered INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS incidents_fingerprint ON incidents(fingerprint, created_at DESC);
 INSERT OR IGNORE INTO store_settings(key,value) VALUES ('offset','0'),('paused','false');
 PRAGMA user_version=1;
 """
@@ -218,7 +236,7 @@ def _record(row: sqlite3.Row | None) -> dict[str, Any] | None:
     for key in JSON_FIELDS & result.keys():
         if result[key] is not None:
             result[key] = json.loads(result[key])
-    for key in ("approved", "language_initialized", "quota_counted", "force_new", "files_deleted", "close_requested", "removed", "reused"):
+    for key in ("approved", "language_initialized", "quota_counted", "force_new", "files_deleted", "close_requested", "removed", "reused", "user_notified", "admins_notified", "retry_offered"):
         if key in result:
             result[key] = bool(result[key])
     return result
@@ -742,6 +760,77 @@ class Store:
             if status in TERMINAL_JOBS and job["status"] not in TERMINAL_JOBS:
                 updates.setdefault("completed_at", _utc())
             self._update("jobs", job_id, updates)
+            return self.get_job(job_id)
+
+    def add_incident(self, kind: str, fingerprint: str, *, job_id: str | None = None,
+                     context: dict[str, Any] | None = None, cooldown_seconds: int = 1800,
+                     user_notified: bool = False) -> tuple[dict[str, Any], bool]:
+        """Записать инцидент, подавив повтор той же причины в пределах паузы."""
+        if kind not in ("job", "service"):
+            raise StoreError("invalid_incident_kind")
+        if not isinstance(fingerprint, str) or not fingerprint or len(fingerprint) > 200:
+            raise StoreError("invalid_fingerprint")
+        if type(cooldown_seconds) is not int or cooldown_seconds < 0:
+            raise StoreError("invalid_cooldown")
+        now = utc_now()
+        cutoff = _utc(now - timedelta(seconds=cooldown_seconds))
+        with self.transaction():
+            existing = self._one(
+                "SELECT * FROM incidents WHERE fingerprint=? AND created_at>? ORDER BY created_at DESC,id DESC LIMIT 1",
+                (fingerprint, cutoff),
+            )
+            if existing:
+                return existing, False
+            incident_id = str(uuid4())
+            self.db.execute(
+                "INSERT INTO incidents(id,kind,fingerprint,job_id,status,created_at,context,user_notified) "
+                "VALUES (?,?,?,?,'queued',?,?,?)",
+                (incident_id, kind, fingerprint, job_id, _utc(now), _json(context or {}), int(user_notified)),
+            )
+            return self.get_incident(incident_id), True
+
+    def get_incident(self, incident_id: str) -> dict[str, Any] | None:
+        return self._one("SELECT * FROM incidents WHERE id=?", (incident_id,))
+
+    def claim_incident(self, incident_id: str) -> dict[str, Any] | None:
+        """Атомарно забрать queued-инцидент, чтобы два unit не запустили агента."""
+        with self.transaction():
+            incident = self.get_incident(incident_id)
+            if not incident or incident["status"] != "queued":
+                return None
+            self._update("incidents", incident_id, {"status": "starting", "started_at": _utc()})
+            return self.get_incident(incident_id)
+
+    def update_incident(self, incident_id: str, **fields: Any) -> dict[str, Any]:
+        allowed = {
+            "status", "started_at", "finished_at", "prompt_path", "report_path", "output_path",
+            "model", "exit_code", "error", "user_notified", "admins_notified", "retry_offered",
+        }
+        if fields.keys() - allowed:
+            raise StoreError("invalid_field")
+        with self.transaction():
+            if not self.get_incident(incident_id):
+                raise StoreError("not_found")
+            updates = {key: _utc(value) if key.endswith("_at") and value is not None else value
+                       for key, value in fields.items()}
+            self._update("incidents", incident_id, updates)
+            return self.get_incident(incident_id)
+
+    def retry_job(self, owner_id: int, job_id: str, now_utc: datetime) -> Job:
+        """Вернуть упавшее задание в очередь, сохранив вход и снимок параметров."""
+        with self.transaction():
+            job = self._owned("jobs", owner_id, job_id)
+            if job["status"] != "failed" or job["failure_reason"] not in RETRYABLE_FAILURES:
+                raise StoreError("retry_unavailable")
+            if self._bound(job_id):
+                raise StoreError("process_bound")
+            now = _utc(now_utc)
+            self._update("jobs", job_id, {
+                "status": "queued", "accepted_at": now, "started_at": None, "completed_at": None,
+                "failure_reason": None, "cancellation_actor_id": None, "cancellation_reason": None,
+                "metrics": _json({}), "resources": _json({}), "engine_version": None, "engine_commit": None,
+            })
+            self._update("drafts", job_id, {"status": "submitted", "updated_at": now})
             return self.get_job(job_id)
 
     def _work_path(self, work_uuid: str) -> Path:

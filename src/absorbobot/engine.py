@@ -19,12 +19,13 @@ from absorbobot.delivery import Delivery, package_result
 from absorbobot.i18n import tr
 from absorbobot.identity import work_title
 from absorbobot.intake import Intake
+from absorbobot.incident import IncidentManager, JOB_STALL_SECONDS
 from absorbobot.metrics import JournalIngestor, PhaseMetrics, aggregate_reports
 from absorbobot.pricing import Pricing
 from absorbobot.reporting import (REPORT_ORDER, TERMINAL_STAGES, progress_import,
                                   progress_report, stage_key)
 from absorbobot.sandbox import Sandbox, SandboxError
-from absorbobot.store import StoreError, TERMINAL_JOBS, utc_now
+from absorbobot.store import INTERNAL_FAILURES, RETRYABLE_FAILURES, StoreError, TERMINAL_JOBS, utc_now
 
 
 class Engine:
@@ -38,12 +39,19 @@ class Engine:
         self.delivery = Delivery(settings, store)
         self.pricing = Pricing()
         self.store.save_tariff_snapshot(self.pricing.snapshot)
+        self.incidents = IncidentManager(settings, store)
         self._active = None
         self._active_uuid = None
         self._active_kind = None
         self._stopping = False
+        self._activity = time.monotonic()
+        self._stall_handled: set[str] = set()
         self._delivery_tasks = {}
         self._progress = {}
+
+    def _touch(self) -> None:
+        """Отметить признак жизни задания для сторожа зависаний."""
+        self._activity = time.monotonic()
 
     def _notice(self, owner, work_uuid, key, *, source=None, purpose=None, dedupe=None, **values):
         user = self.store.get_user(owner)
@@ -118,6 +126,88 @@ class Engine:
             await asyncio.shield(task)
         self._delivery_tasks.clear()
 
+    def _failure_context(self, job: dict, phase: str | None = None, code: str | None = None) -> dict:
+        """Собрать безопасный снимок для агента: без ключей и содержимого входа."""
+        tree = self.settings.storage_dir / "jobs" / job["id"]
+        journal = tree / "events.jsonl"
+        tail = ""
+        try:
+            with open(journal, "rb") as stream:
+                stream.seek(0, os.SEEK_END)
+                size = stream.tell()
+                stream.seek(max(0, size - 32768))
+                tail = stream.read().decode("utf-8", "replace")[-12000:]
+        except OSError:
+            tail = ""
+        try:
+            free = shutil.disk_usage(self.settings.storage_dir).free
+        except OSError:
+            free = None
+        models = {}
+        snapshot = job.get("snapshot") or {}
+        for category, model in (snapshot.get("models") or {}).items():
+            if isinstance(model, dict):
+                models[category] = {"name": model.get("name"), "local": model.get("local")}
+        return {
+            "job_id": job["id"],
+            "owner_id": job["owner_id"],
+            "status": job["status"],
+            "failure_reason": job.get("failure_reason"),
+            "code": code,
+            "accepted_at": job.get("accepted_at"),
+            "started_at": job.get("started_at"),
+            "phase": phase,
+            "metrics": job.get("metrics") or {},
+            "models": models,
+            "process_bindings": self.store.process_bindings(),
+            "journal_path": str(journal),
+            "journal_tail": tail,
+            "work_tree": str(tree),
+            "free_bytes": free,
+        }
+
+    async def _stall(self, job_id: str) -> None:
+        """Зафиксировать зависание задания и передать его диагносту."""
+        if job_id in self._stall_handled:
+            return
+        job = self.store.get_job(job_id)
+        if not job or job["status"] in TERMINAL_JOBS:
+            return
+        self._stall_handled.add(job_id)
+        phase = (self._progress.get(job_id) or {}).get("stage")
+        context = self._failure_context(job, phase, "stalled")
+        try:
+            self.store.update_job(job_id, status="failed", failure_reason="stalled",
+                                  metrics=job.get("metrics") or {})
+        except StoreError:
+            return
+        self._drop_progress(job["owner_id"], job_id)
+        self._notice(job["owner_id"], job_id, "engine.system_failure",
+                     source=job.get("source_message_id"), dedupe=f"stalled:{job_id}")
+        await self.incidents.job_failure(job, "stalled", context=context, user_notified=True)
+        if self._active_uuid == job_id and self._active is not None and not self._active.done():
+            self._active.cancel()
+
+    async def _watchdog(self, stop) -> None:
+        """Сторож зависаний: 15 минут без событий задания считаются сбоем."""
+        while not stop.is_set() and not self._stopping:
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=5)
+            except TimeoutError:
+                pass
+            if stop.is_set() or self._stopping:
+                return
+            if self._active is None or self._active_kind != "job":
+                continue
+            job_id = self._active_uuid
+            if not job_id or job_id in self._stall_handled:
+                continue
+            if time.monotonic() - self._activity >= JOB_STALL_SECONDS:
+                try:
+                    await self._stall(job_id)
+                except (StoreError, OSError):
+                    continue
+
     def _domain_outbox(self):
         rows = self.store.db.execute(
             "SELECT * FROM outbox WHERE status='pending' AND available_at<=? "
@@ -127,6 +217,7 @@ class Engine:
         return [{**dict(row), "payload": json.loads(row["payload"])} for row in rows]
 
     async def run(self, stop):
+        watchdog = asyncio.create_task(self._watchdog(stop))
         try:
             while not stop.is_set() and not self._stopping:
                 self.delivery.reconcile()
@@ -145,7 +236,8 @@ class Engine:
                         await task
                         del self._delivery_tasks[key]
                 if self._active is not None and self._active.done():
-                    await self._active
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await self._active
                     self._active = self._active_uuid = self._active_kind = None
                 if self._active is None and not self.store.paused():
                     try:
@@ -167,6 +259,9 @@ class Engine:
                 except TimeoutError:
                     pass
         finally:
+            watchdog.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await watchdog
             await self.shutdown()
 
     async def _import(self, item):
@@ -401,6 +496,8 @@ class Engine:
 
     def _journal(self, job, ingestor, path, metrics, *, final=False):
         events = ingestor.read(path, final=final)
+        if events:
+            self._touch()
         for event in events:
             if event.get("store_error"):
                 raise StoreError("journal_persistence_failed")
@@ -444,6 +541,7 @@ class Engine:
             raise SandboxError("timeout")
         sampler = PhaseMetrics(self.settings, self.store, job["id"], phase)
         result = None
+        self._touch()
         try:
             async with sampler:
                 task = asyncio.create_task(self.sandbox.run(
@@ -477,6 +575,7 @@ class Engine:
 
     async def _process(self, job):
         started = time.monotonic()
+        self._touch()
         metrics = deepcopy(job["metrics"])
         deadline = started + self.settings.max_processing_seconds
         metrics["queue_wait_seconds"] = max(0, (utc_now() - datetime.fromisoformat(job["accepted_at"])).total_seconds())
@@ -528,6 +627,7 @@ class Engine:
             try:
                 while not packaging.done():
                     self._progress_action(job, "stage.package")
+                    self._touch()
                     await asyncio.sleep(0.25)
                 await asyncio.shield(packaging)
             except asyncio.CancelledError:
@@ -566,8 +666,14 @@ class Engine:
                 else:
                     self.store.update_job(job["id"], status="failed", failure_reason=code,
                                           metrics=metrics, resources=self._resources(reports))
-                    self._notice(job["owner_id"], job["id"], "engine.failed", source=job["source_message_id"],
-                                 dedupe=f"failed:{job['id']}")
+                    if code in INTERNAL_FAILURES and not self._stopping:
+                        context = self._failure_context(job, code=code)
+                        self._notice(job["owner_id"], job["id"], "engine.system_failure",
+                                     source=job["source_message_id"], dedupe=f"failed:{job['id']}")
+                        await self.incidents.job_failure(job, code, context=context, user_notified=True)
+                    else:
+                        self._notice(job["owner_id"], job["id"], "engine.failed", source=job["source_message_id"],
+                                     dedupe=f"failed:{job['id']}")
                     self._administrator_error(job["id"], code)
         finally:
             if (tree / "events.jsonl").is_file():

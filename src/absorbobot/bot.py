@@ -375,12 +375,14 @@ async def publish_commands(bot: Bot, dialog: Dialog) -> None:
 async def serve(settings: Settings) -> None:
     """Запустить установленный бот; сначала остановить старые деревья процессов."""
     from absorbobot.engine import Engine
+    from absorbobot.watchdog import SystemdWatchdog
 
     core = probe_core(settings)
     session = AiohttpSession(api=TelegramAPIServer.from_base(
         settings.bot_api_url, is_local=settings.bot_api_url != "https://api.telegram.org"))
     bot = Bot(os.environ["ABSORBOBOT_TOKEN"], session=session)
     stop = asyncio.Event()
+    watchdog = SystemdWatchdog()
     loop = asyncio.get_running_loop()
     signals = (signal.SIGINT, signal.SIGTERM)
     for value in signals:
@@ -392,9 +394,11 @@ async def serve(settings: Settings) -> None:
             try:
                 await engine.recover()
                 await publish_commands(bot, dialog)
+                watchdog.ready()
                 async with asyncio.TaskGroup() as tasks:
                     polling = tasks.create_task(poll(bot, UpdateRouter(store, dialog, admin), stop))
                     outgoing = tasks.create_task(TelegramOutbox(bot, store).run(stop))
+                    tasks.create_task(watchdog.run(stop))
                     tasks.create_task(engine.run(stop))
                     await stop.wait()
                     polling.cancel()
@@ -402,6 +406,7 @@ async def serve(settings: Settings) -> None:
                     await engine.shutdown()
             finally:
                 stop.set()
+                watchdog.stopping()
                 await engine.shutdown()
     finally:
         for value in signals:

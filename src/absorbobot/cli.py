@@ -74,13 +74,14 @@ def render_units(settings: Settings, *, uv_binary: str | Path | None = None) -> 
     if settings.bot_api_url == "https://api.telegram.org":
         bot = _exec([uv, "tool", "run", "--offline", "--no-config", "absorbobot", "serve", "--config", settings.config_path])
         return {"absorbobot.service": (
-            f"[Unit]\nDescription=Absorbobot\n{_START_LIMITS}\n[Service]\nType=simple\n"
+            f"[Unit]\nDescription=Absorbobot\n{_START_LIMITS}OnFailure=absorbobot-diagnose@onfailure.service\n"
+            f"[Service]\nType=notify\nNotifyAccess=all\nWatchdogSec=120s\nTimeoutStartSec=90s\n"
             f"WorkingDirectory={str(settings.state_dir).replace('%', '%%')}\n"
             f"EnvironmentFile={str(settings.secrets_file).replace('%', '%%')}\n"
             f"ExecStartPre={pre}\nExecStart={bot}\n"
             f"{_SERVICE_TAIL}"
             "\n[Install]\nWantedBy=default.target\n"
-        )}
+        ), "absorbobot-diagnose@.service": _diagnose_unit(settings, uv)}
     # Каталог моделей динамический; native API не должен получать bot/cloud ключи.
     try:
         raw = yaml.safe_load(settings.absorbent_config.read_text(encoding="utf-8"))
@@ -120,11 +121,31 @@ def render_units(settings: Settings, *, uv_binary: str | Path | None = None) -> 
             f"UnsetEnvironment={' '.join(sorted(unset))}\nExecStart={native}\n\n[Install]\nWantedBy=default.target\n"
         ),
         "absorbobot.service": (
-            f"[Unit]\nDescription=Absorbobot\nRequires=absorbobot-api.service\nAfter=absorbobot-api.service\n{_START_LIMITS}\n"
-            f"[Service]\nType=simple\nWorkingDirectory={bot_workdir}\n{common}"
+            f"[Unit]\nDescription=Absorbobot\nRequires=absorbobot-api.service\nAfter=absorbobot-api.service\n"
+            f"{_START_LIMITS}OnFailure=absorbobot-diagnose@onfailure.service\n"
+            f"[Service]\nType=notify\nNotifyAccess=all\nWatchdogSec=120s\nTimeoutStartSec=90s\n"
+            f"WorkingDirectory={bot_workdir}\n{common}"
             f"ExecStart={bot}\n\n[Install]\nWantedBy=default.target\n"
         ),
+        "absorbobot-diagnose@.service": _diagnose_unit(settings, uv),
     }
+
+
+def _diagnose_unit(settings: Settings, uv: str | Path) -> str:
+    """Шаблон отдельного unit: агент переживает перезапуск бота."""
+    state = str(settings.state_dir).replace("%", "%%")
+    command = _exec([uv, "tool", "run", "--offline", "--no-config", "absorbobot",
+                     "diagnose", "--config", settings.config_path, "--incident"])
+    return (
+        "[Unit]\nDescription=Absorbobot emergency diagnosis %i\nStartLimitIntervalSec=0\n"
+        "[Service]\nType=oneshot\n"
+        f"WorkingDirectory={state}\n"
+        f"EnvironmentFile={str(settings.secrets_file).replace('%', '%%')}\n"
+        "Environment=PATH=%h/.cache/.bun/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin\n"
+        f"ExecStart={command} %i\n"
+        "UMask=0077\nKillMode=control-group\nTimeoutStartSec=2400s\nTimeoutStopSec=60s\n"
+        "Restart=no\n\n[Install]\nWantedBy=default.target\n"
+    )
 
 
 def unit_directory() -> Path:
@@ -137,7 +158,7 @@ def unit_directory() -> Path:
 def check_unit_paths(settings: Settings) -> None:
     """Обнаружить устаревшие собственные units после изменения настроек."""
     directory = unit_directory()
-    existing = [name for name in ("absorbobot-api.service", "absorbobot.service") if (directory / name).exists()]
+    existing = [name for name in ("absorbobot-api.service", "absorbobot.service", "absorbobot-diagnose@.service") if (directory / name).exists()]
     if not existing:
         return
     expected = render_units(settings)
@@ -200,9 +221,11 @@ def install_units(settings: Settings) -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="absorbobot", description="Telegram-интерфейс к Absorbent.")
     commands = parser.add_subparsers(dest="command", required=True)
-    for name in ("serve", "check", "check-storage", "install-units"):
+    for name in ("serve", "check", "check-storage", "install-units", "diagnose"):
         command = commands.add_parser(name)
         command.add_argument("--config", required=True, type=Path)
+        if name == "diagnose":
+            command.add_argument("--incident", required=True)
     return parser
 
 
@@ -217,6 +240,11 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "install-units":
             install_units(settings)
             print("Собственные user units созданы; daemon-reload выполнен.")
+            return 0
+        if args.command == "diagnose":
+            os.environ.update(load_secrets(settings))
+            from absorbobot.incident import run_incident
+            run_incident(settings, args.incident)
             return 0
         result = check_runtime(settings)
         check_unit_paths(settings)

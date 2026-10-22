@@ -72,6 +72,26 @@ systemctl --user restart absorbobot.service
   `REPORT_ORDER`; этап приёма файла показывается отдельной строкой вне
   таблицы, а ключ `stage.<имя>` в `locales/{ru,en}.json` нужен тесту
   каталога; незнакомый этап молча пропускается, не роняя задание;
-- снимок моделей задания ([`Engine::_snapshot_config()`](src/absorbobot/engine.py))
+- Снимок моделей задания ([`Engine::_snapshot_config()`](src/absorbobot/engine.py))
   ожидает у модели ключи `name`, `spec`, `provider`, `local`, а провайдера
   копирует целиком — так новые поля ядра доезжают до запуска без отдельного кода.
+
+## Аварийная диагностика
+
+- Внутренние ошибки задания перечислены в `INTERNAL_FAILURES`
+  ([`store.py`](src/absorbobot/store.py)); для них движок создаёт запись в
+  `incidents` и запускает `absorbobot-diagnose@<id>.service`. Пользовательские
+  отказы и отмены диагноста не запускают.
+- [`IncidentManager`](src/absorbobot/incident.py) пишет промпт и запускает
+  отдельный unit через `systemctl --user`; сам бот не ждёт агента. Повторный
+  сбой с той же причиной в течение 30 минут подавляется.
+- [`run_incident()`](src/absorbobot/incident.py) работает в отдельном процессе:
+  шлёт администраторам запуск и полный отчёт, а пользователю — только
+  нейтральное сообщение. Отчёт агента читается из `report.md` и `result.json`
+  в `<state_dir>/incidents/<id>/`.
+- [`SystemdWatchdog`](src/absorbobot/watchdog.py) шлёт `READY=1` и
+  `WATCHDOG=1`; `WatchdogSec=120s` в unit и 15-минутный сторож заданий
+  ([`Engine::_watchdog()`](src/absorbobot/engine.py)) покрывают зависания.
+- Кнопка «Повторить» использует [`Store::retry_job()`](src/absorbobot/store.py)
+  и [`reset_work_tree()`](src/absorbobot/config.py): вход сохраняется,
+  результаты прошлого запуска удаляются.

@@ -33,7 +33,7 @@ def test_install_only_own_units_and_reload(settings, monkeypatch, tmp_path):
     monkeypatch.setattr(cli.subprocess, "run", lambda argv, **kw: calls.append(argv) or SimpleNamespace(returncode=0))
     cli.install_units(settings)
     assert unrelated.read_text() == "untouched"
-    assert {p.name for p in directory.iterdir()} == {"unrelated.service", "absorbobot.service", "absorbobot-api.service"}
+    assert {p.name for p in directory.iterdir()} == {"unrelated.service", "absorbobot.service", "absorbobot-api.service", "absorbobot-diagnose@.service"}
     assert calls == [["/usr/bin/systemctl", "--user", "daemon-reload"]]
     assert (settings.state_dir / "telegram-api").is_dir()
     assert (settings.storage_dir / "telegram-api-files").is_dir()
@@ -147,12 +147,21 @@ def test_getme_only_and_safe_token_errors(settings, monkeypatch, mode):
 
 def test_generated_units_limit_restart_storm(settings):
     units = cli.render_units(settings, uv_binary="/usr/bin/true")
-    assert set(units) == {"absorbobot.service", "absorbobot-api.service"}
-    for name, unit in units.items():
+    assert set(units) == {"absorbobot.service", "absorbobot-api.service", "absorbobot-diagnose@.service"}
+    for name in ("absorbobot.service", "absorbobot-api.service"):
+        unit = units[name]
         assert "\nStartLimitIntervalSec=60\n" in unit, name
         assert "\nStartLimitBurst=10\n" in unit, name
         assert "\nRestartSec=5s\n" in unit, name
         assert "\nRestart=on-failure\n" in unit, name
+    bot = units["absorbobot.service"]
+    assert "Type=notify" in bot
+    assert "WatchdogSec=120s" in bot
+    assert "OnFailure=absorbobot-diagnose@onfailure.service" in bot
+    diagnose = units["absorbobot-diagnose@.service"]
+    assert "diagnose" in diagnose and '--incident" %i' in diagnose
+    assert "Type=oneshot" in diagnose
+    assert "TimeoutStartSec=2400s" in diagnose
 
 
 def test_missing_token_distinguished(settings):

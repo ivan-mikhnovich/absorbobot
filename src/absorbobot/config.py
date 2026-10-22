@@ -214,6 +214,34 @@ def create_work_tree(settings: Settings, work_uuid: str) -> Path:
     return root
 
 
+def reset_work_tree(settings: Settings, work_uuid: str) -> Path:
+    """Очистить результаты прошлого запуска, сохранив принятый вход задания."""
+    try:
+        valid = str(UUID(work_uuid)) == work_uuid
+    except (ValueError, TypeError, AttributeError):
+        valid = False
+    if not valid:
+        raise ConfigError("Некорректный UUID рабочего каталога.")
+    root = settings.storage_dir / "jobs" / work_uuid
+    if root.parent.is_symlink() or root.is_symlink() or not root.resolve().is_relative_to(settings.storage_dir.resolve()):
+        raise ConfigError("Рабочий каталог вышел за storage_dir.")
+    if not root.is_dir():
+        raise ConfigError("Рабочий каталог задания не найден.")
+    for name in ("output", "tmp"):
+        target = root / name
+        if target.is_symlink():
+            raise ConfigError("Рабочий подкаталог содержит небезопасную ссылку.")
+        if target.exists():
+            shutil.rmtree(target)
+        target.mkdir(mode=0o700)
+    for name in ("config.yaml", "events.jsonl"):
+        target = root / name
+        if target.is_symlink():
+            raise ConfigError("Рабочий файл содержит небезопасную ссылку.")
+        target.unlink(missing_ok=True)
+    return root
+
+
 def _parse_envfile(text: str) -> dict[str, str]:
     """Разобрать EnvironmentFile без shell, интерполяции или исполнения команд."""
     result: dict[str, str] = {}

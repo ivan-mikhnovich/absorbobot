@@ -332,5 +332,16 @@
   "engine.cancelled_admin": "{id}: cancelled by administrator.",
   "engine.interrupted": "{id}: interrupted by restart. Processing is not automatically repeated; files are retained.",
   "engine.delivery_unavailable": "{id}: result unavailable for delivery. Files may have been deleted or access to the original result revoked; processing was not repeated.",
-  "engine.failed": "{id}: processing failed. Files and history are retained; contact an administrator."
+  "engine.failed": "{id}: processing failed. Files and history are retained; contact an administrator.",
+  "engine.system_failure": "Absorbobot has encountered a system failure. A diagnostic and repair agent has been started; the problem is likely to be resolved within half an hour. We apologise for the inconvenience.",
+  "incident.retry_offer": "The fault is fixed. You can retry processing this recording.",
+  "incident_status_fixed": "fixed",
+  "incident_status_partial": "partially fixed",
+  "incident_status_not_fixed": "not fixed",
+  "incident_status_failed": "diagnosis failed",
+  "incident_status_unknown": "outcome unknown",
+  "incident_admin_launch": "The Absorbobot diagnostic agent has started.\nIncident: {id}\nReason: {reason}\nModel: {model}\nThe full report will follow in a separate message.",
+  "incident_admin_report": "Diagnosis finished.\nIncident: {id}\nStatus: {status}\n\n{summary}",
+  "incident_report_file": "Full agent report",
+  "button.retry": "Retry"
 }
