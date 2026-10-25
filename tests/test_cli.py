@@ -145,6 +145,82 @@ def test_getme_only_and_safe_token_errors(settings, monkeypatch, mode):
     assert set(events) <= {"getMe", "close"}
 
 
+def test_getme_retries_transient_network_errors(settings, monkeypatch):
+    import aiogram
+    import aiogram.client.session.aiohttp as session_module
+    from aiogram.exceptions import TelegramNetworkError
+    from aiogram.methods import GetMe
+
+    events, sleeps = [], []
+
+    class Session:
+        def __init__(self, **kwargs):
+            pass
+
+        async def close(self):
+            events.append("close")
+
+    class Bot:
+        def __init__(self, token, session):
+            self.calls = 0
+
+        async def get_me(self):
+            self.calls += 1
+            events.append(f"getMe{self.calls}")
+            if self.calls <= 2:
+                raise TelegramNetworkError(method=GetMe(), message="ClientConnectorError: private-token")
+            return SimpleNamespace(username="absorbobot", id=10, is_bot=True)
+
+    async def fake_sleep(value):
+        sleeps.append(value)
+
+    monkeypatch.setattr(aiogram, "Bot", Bot)
+    monkeypatch.setattr(session_module, "AiohttpSession", Session)
+    monkeypatch.setattr(cli.asyncio, "sleep", fake_sleep)
+    identity = asyncio.run(cli.check_telegram(settings, {"ABSORBOBOT_TOKEN": "private-token"}))
+    assert identity == {"id": 10, "username": "absorbobot"}
+    assert events == ["getMe1", "getMe2", "getMe3", "close"]
+    assert sleeps == [2.0, 4.0]
+
+
+def test_getme_exhausted_retries_report_once(settings, monkeypatch, capsys):
+    import aiogram
+    import aiogram.client.session.aiohttp as session_module
+    from aiogram.exceptions import TelegramNetworkError
+    from aiogram.methods import GetMe
+
+    events, sleeps = [], []
+
+    class Session:
+        def __init__(self, **kwargs):
+            pass
+
+        async def close(self):
+            events.append("close")
+
+    class Bot:
+        def __init__(self, token, session):
+            pass
+
+        async def get_me(self):
+            events.append("getMe")
+            raise TelegramNetworkError(method=GetMe(), message="ClientConnectorError: private-token")
+
+    async def fake_sleep(value):
+        sleeps.append(value)
+
+    monkeypatch.setattr(aiogram, "Bot", Bot)
+    monkeypatch.setattr(session_module, "AiohttpSession", Session)
+    monkeypatch.setattr(cli.asyncio, "sleep", fake_sleep)
+    with pytest.raises(config.ConfigError) as caught:
+        asyncio.run(cli.check_telegram(settings, {"ABSORBOBOT_TOKEN": "private-token"}))
+    assert "Не удалось выполнить getMe Telegram Bot API" in str(caught.value)
+    assert events.count("getMe") == len(cli._GETME_RETRY_DELAYS) + 1
+    assert events[-1] == "close"
+    assert sleeps == list(cli._GETME_RETRY_DELAYS)
+    assert "private-token" not in capsys.readouterr().err
+
+
 def test_generated_units_limit_restart_storm(settings):
     units = cli.render_units(settings, uv_binary="/usr/bin/true")
     assert set(units) == {"absorbobot.service", "absorbobot-api.service", "absorbobot-diagnose@.service"}

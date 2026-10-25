@@ -18,6 +18,13 @@ import yaml
 from absorbobot.config import ConfigError, Settings, check_runtime, check_storage, load_secrets, load_settings
 
 
+# Сетевые отказы при старте службы: после загрузки машины сеть может быть ещё
+# не настроена, и единственная попытка getMe роняла запуск (код 2) вместе с
+# аварийной диагностикой. Повторы укладываются в TimeoutStartSec=90s.
+_GETME_TIMEOUT_SECONDS = 15
+_GETME_RETRY_DELAYS = (2.0, 4.0, 8.0)
+
+
 async def check_telegram(settings: Settings, env: dict[str, str]) -> dict:
     """Проверить только getMe выбранного API, не отправляя сообщений."""
     token = env.get("ABSORBOBOT_TOKEN")
@@ -26,23 +33,36 @@ async def check_telegram(settings: Settings, env: dict[str, str]) -> dict:
     from aiogram import Bot
     from aiogram.client.session.aiohttp import AiohttpSession
     from aiogram.client.telegram import TelegramAPIServer
-    from aiogram.exceptions import TelegramUnauthorizedError
+    from aiogram.exceptions import TelegramNetworkError, TelegramServerError, TelegramUnauthorizedError
     from aiogram.utils.token import TokenValidationError
 
     session = AiohttpSession(api=TelegramAPIServer.from_base(
-        settings.bot_api_url, is_local=settings.bot_api_url != "https://api.telegram.org"), timeout=30)
+        settings.bot_api_url, is_local=settings.bot_api_url != "https://api.telegram.org"),
+        timeout=_GETME_TIMEOUT_SECONDS)
     try:
-        bot = Bot(token=token, session=session)
-        me = await bot.get_me()
+        try:
+            bot = Bot(token=token, session=session)
+        except TokenValidationError:
+            raise ConfigError("Неверный ABSORBOBOT_TOKEN: Telegram не подтвердил авторизацию.") from None
+        delays = _GETME_RETRY_DELAYS
+        for attempt in range(len(delays) + 1):
+            try:
+                me = await bot.get_me()
+            except TelegramUnauthorizedError:
+                raise ConfigError("Неверный ABSORBOBOT_TOKEN: Telegram не подтвердил авторизацию.") from None
+            except (TelegramNetworkError, TelegramServerError) as exc:
+                if attempt == len(delays):
+                    raise ConfigError("Не удалось выполнить getMe Telegram Bot API.") from None
+                print(f"getMe не выполнен: {type(exc).__name__}; повтор через {delays[attempt]:.0f} с.",
+                      file=sys.stderr)
+                await asyncio.sleep(delays[attempt])
+                continue
+            except Exception:
+                raise ConfigError("Не удалось выполнить getMe Telegram Bot API.") from None
+            break
         if (me.username or "").lower() != "absorbobot" or not me.is_bot:
             raise ConfigError("getMe подтвердил не бота @absorbobot.")
         return {"id": me.id, "username": me.username}
-    except (TelegramUnauthorizedError, TokenValidationError):
-        raise ConfigError("Неверный ABSORBOBOT_TOKEN: Telegram не подтвердил авторизацию.") from None
-    except ConfigError:
-        raise
-    except Exception:
-        raise ConfigError("Не удалось выполнить getMe Telegram Bot API.") from None
     finally:
         await session.close()
 
