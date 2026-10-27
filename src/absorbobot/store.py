@@ -18,6 +18,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Iterator, Literal
 from uuid import UUID, uuid4
 
+from .audio import AudioError, normalize_document
+
 if TYPE_CHECKING:
     from .config import Settings
 
@@ -660,6 +662,11 @@ class Store:
         media = [file for file in self.files(draft_id) if file["role"] == "media" and not file["removed"]]
         if len(media) != 1:
             raise StoreError("draft_incomplete")
+        # Несколько дорожек без явного выбора не должны дойти до оплаты.
+        try:
+            normalize_document(draft["snapshot"].get("audio"), require_selection=True)
+        except AudioError as exc:
+            raise StoreError(exc.code) from None
         if self._bound(draft_id):
             raise StoreError("process_bound")
         return draft

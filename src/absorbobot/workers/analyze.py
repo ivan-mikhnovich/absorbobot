@@ -9,6 +9,7 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+import unicodedata
 from uuid import uuid4
 
 
@@ -19,6 +20,76 @@ class AnalysisError(ValueError):
 # Пределы предпросмотра: один кадр, ограниченные стороны и вес JPEG.
 _PREVIEW_MAX_BYTES = 262144
 _PREVIEW_MAX_SIDE = 640
+
+
+_TRACK_TITLE_LIMIT = 120
+_TRACK_LANGUAGE_LIMIT = 32
+
+
+def _track_text(value, limit: int) -> str | None:
+    """Оставить однострочные метаданные дорожки без управляющих знаков."""
+    if not isinstance(value, str):
+        return None
+    text = "".join(" " if char.isspace() else char for char in value
+                   if char.isspace() or unicodedata.category(char)[:1] != "C")
+    text = " ".join(text.split())[:limit].strip()
+    return text or None
+
+
+def _track_number(value, *, integer: bool) -> int | float | None:
+    """Конечное число ffprobe; индексы и число каналов неотрицательны."""
+    if isinstance(value, bool):
+        return None
+    if integer:
+        return value if type(value) is int and value >= 0 else None
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def audio_tracks(info: dict) -> list[dict]:
+    """Перечислить звуковые потоки записи до оплачиваемого распознавания речи.
+
+    ``offset`` — начало дорожки относительно начала контейнера: ядро сводит
+    расшифровки дорожек в общую хронологию по этому смещению.
+    """
+    start = _track_number((info.get("format") or {}).get("start_time"), integer=False)
+    origin = 0.0 if start is None else start
+    tracks = []
+    for stream in info.get("streams", []):
+        if not isinstance(stream, dict) or stream.get("codec_type") != "audio":
+            continue
+        index = _track_number(stream.get("index"), integer=True)
+        if index is None:
+            raise AnalysisError("invalid_media_metadata")
+        stream_start = _track_number(stream.get("start_time"), integer=False)
+        start_time = origin if stream_start is None else stream_start
+        if stream_start is None:
+            pts = _track_number(stream.get("start_pts"), integer=False)
+            time_base = stream.get("time_base", "")
+            if pts is not None and isinstance(time_base, str) and "/" in time_base:
+                numerator, denominator = time_base.split("/", 1)
+                num = _track_number(numerator, integer=False)
+                den = _track_number(denominator, integer=False)
+                if num is not None and den:
+                    stream_start = _track_number(pts * num / den, integer=False)
+            start_time = origin if stream_start is None else stream_start
+        disposition = stream.get("disposition") if isinstance(stream.get("disposition"), dict) else {}
+        tags = stream.get("tags") if isinstance(stream.get("tags"), dict) else {}
+        tracks.append({
+            "index": index,
+            "title": _track_text(tags.get("title"), _TRACK_TITLE_LIMIT),
+            "language": _track_text(tags.get("language"), _TRACK_LANGUAGE_LIMIT),
+            "default": disposition.get("default") == 1,
+            "channels": _track_number(stream.get("channels"), integer=True) or 0,
+            "start_time": start_time,
+            "offset": start_time - origin,
+        })
+    if not tracks:
+        raise AnalysisError("missing_audio")
+    return tracks
 
 
 def media_metadata(info: dict, max_seconds: float) -> dict:
@@ -34,10 +105,7 @@ def media_metadata(info: dict, max_seconds: float) -> dict:
         raise AnalysisError("invalid_duration")
     if duration > max_seconds:
         raise AnalysisError("media_too_long")
-    if not any(isinstance(stream, dict) and stream.get("codec_type") == "audio"
-               for stream in info.get("streams", [])):
-        raise AnalysisError("missing_audio")
-    return {"duration": duration, "pages": None}
+    return {"duration": duration, "pages": None, "audio_tracks": audio_tracks(info)}
 
 
 def pdf_pages(text: str, remaining_pages: int) -> int:
@@ -140,7 +208,10 @@ def analyze(source: Path, role: str, max_seconds: float, remaining_pages: int,
     if role == "media":
         try:
             text = _command(["ffprobe", "-v", "error", "-show_entries",
-                             "format=duration:stream=codec_type", "-of", "json", str(source)],
+                             "format=duration,start_time:"
+                             "stream=index,codec_type,channels,start_time,start_pts,time_base:"
+                             "stream_tags=title,language:stream_disposition=default",
+                             "-of", "json", str(source)],
                             directory, timeout=30)
         except AnalysisError as exc:
             # Повреждённая запись — это отказ по длительности, а не по материалу.

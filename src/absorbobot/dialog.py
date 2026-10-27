@@ -9,6 +9,8 @@ import json
 import math
 from pathlib import PurePath
 
+from .audio import (AudioError, from_snapshot, from_state, normalize_document,
+                    speaker_name, state_fields)
 from .config import ConfigError, reset_work_tree
 from .i18n import tr
 from .identity import work_title, work_preview
@@ -21,7 +23,7 @@ COMMANDS = ('start', 'new', 'jobs', 'settings', 'language', 'help', 'cancel', 's
 NUMBERS = ('fps', 'hash_threshold', 'min_scene_seconds', 'slides_dpi')
 CATEGORIES = ('stt', 'vision', 'llm')
 UNFINISHED = ['queued', 'preparing', 'running', 'awaiting_reuse_choice', 'cancel_requested']
-ACTIONS = {'nav', 'lang', 'new_confirm', 'files_added', 'advanced', 'choose', 'set', 'number', 'reset', 'summary', 'submit', 'reuse', 'force_new', 'late_reuse', 'late_force', 'history', 'redeliver', 'cancel_confirm', 'media', 'materials', 'retry'}
+ACTIONS = {'nav', 'lang', 'new_confirm', 'files_added', 'advanced', 'choose', 'set', 'number', 'reset', 'summary', 'submit', 'reuse', 'force_new', 'late_reuse', 'late_force', 'history', 'redeliver', 'cancel_confirm', 'media', 'materials', 'retry', 'audio_toggle', 'audio_speaker', 'audio_clear', 'audio_done'}
 
 
 def now_utc():
@@ -105,6 +107,116 @@ class Dialog:
         if not draft or draft['status'] not in ('collecting', 'preparing', 'ready') or draft['close_requested']:
             raise StoreError('draft_consumed')
         return draft
+
+    @staticmethod
+    def _short(value, limit: int = 32) -> str:
+        """Сократить недоверенное название для текста кнопки."""
+        return value if len(value) <= limit else value[:limit - 1] + '…'
+
+    def _audio_document(self, draft):
+        try:
+            return from_state(draft['ui_state'])
+        except AudioError:
+            raise StoreError('draft_incomplete') from None
+
+    def _audio_ready(self, draft) -> bool:
+        """Несколько дорожек требуют явного подмножества, одна выбрана сама."""
+        audio = self._audio_document(draft)
+        return len(audio['tracks']) <= 1 or bool(audio['selected'])
+
+    def _audio_values(self, document):
+        """Проверить выбор дорожек перед сохранением в снимок."""
+        try:
+            return normalize_document(document, require_selection=True)
+        except AudioError as exc:
+            raise StoreError(exc.code) from None
+
+    def _set_audio(self, owner, draft_id, document):
+        """Сохранить выбор дорожек, отменив устаревшую сводку и подпись."""
+        draft = self._target(owner, draft_id)
+        try:
+            values = normalize_document(document, require_selection=False)
+        except AudioError as exc:
+            raise StoreError(exc.code) from None
+        state = dict(draft['ui_state'])
+        state.update(state_fields(values))
+        state.pop('audio_prompt', None)
+        fields = {'ui_state': state, 'input_signature': None, 'snapshot': {}}
+        if draft['status'] == 'ready':
+            # Готовая сводка больше не соответствует выбору дорожек.
+            fields['status'] = 'collecting'
+        self.store.update_draft(owner, draft_id, **fields)
+        return self.store.get_draft(draft_id, owner)
+
+    def _audio_title(self, owner, track) -> str:
+        return track['title'] or tr(self._language(owner), 'dialog.audio_untitled')
+
+    def _audio_menu(self, owner, draft_id):
+        """Показать дорожки записи: выбор подмножества и привязка человека."""
+        draft = self._target(owner, draft_id)
+        audio = self._audio_document(draft)
+        lang = self._language(owner)
+        selected = set(audio['selected'])
+        lines = [tr(lang, 'dialog.audio_tracks', count=len(audio['tracks']))]
+        rows = []
+        for track in audio['tracks']:
+            index = track['index']
+            title = self._audio_title(owner, track)
+            lines.append(tr(lang, 'dialog.audio_track', index=index, title=title,
+                             track_language=track['language'] or tr(lang, 'unknown'),
+                             channels=track['channels'],
+                             default=tr(lang, 'dialog.audio_default_yes' if track['default']
+                                        else 'dialog.audio_default_no')))
+            mark = '✓' if index in selected else '☐'
+            rows.append([self._button(owner, f'{mark} {index}: {self._short(title)}',
+                                      'audio_toggle', draft_id, {'index': index}, literal=True)])
+        for index in sorted(selected):
+            speaker = audio['speakers'].get(index)
+            label = tr(lang, 'button.audio_speaker')
+            if speaker:
+                label += ': ' + self._short(speaker)
+            rows.append([self._button(owner, label, 'audio_speaker', draft_id,
+                                      {'index': index}, literal=True)])
+            if speaker:
+                rows.append([self._button(owner, 'button.audio_clear', 'audio_clear',
+                                          draft_id, {'index': index})])
+        rows.append([self._button(owner, 'button.audio_done', 'audio_done', draft_id)])
+        self._send(owner, '\n'.join(lines), rows)
+
+    def _audio_prompt(self, owner, draft_id, index):
+        """Запросить имя человека для выбранной дорожки в свободном тексте."""
+        draft = self._target(owner, draft_id)
+        audio = self._audio_document(draft)
+        if index not in audio['selected']:
+            raise StoreError('audio_selection_invalid')
+        state = dict(draft['ui_state'])
+        state['audio_prompt'] = index
+        self.store.update_draft(owner, draft_id, ui_state=state)
+        track = next(track for track in audio['tracks'] if track['index'] == index)
+        self._send(owner, tr(self._language(owner), 'dialog.audio_speaker_prompt',
+                             index=index, title=self._audio_title(owner, track)))
+
+    def _set_speaker(self, owner, draft, name):
+        """Привязать введённое имя к ожидающей дорожке."""
+        state = dict(draft['ui_state'])
+        index = state.get('audio_prompt')
+        audio = self._audio_document(draft)
+        if index not in audio['selected']:
+            raise StoreError('audio_selection_invalid')
+        try:
+            value = speaker_name(name)
+        except AudioError:
+            raise StoreError('invalid_speaker') from None
+        audio['speakers'][index] = value
+        state.update(state_fields(self._audio_values(audio)))
+        state.pop('audio_prompt', None)
+        fields = {'ui_state': state, 'input_signature': None, 'snapshot': {}}
+        if draft['status'] == 'ready':
+            fields['status'] = 'collecting'
+        self.store.update_draft(owner, draft['id'], **fields)
+        self._send(owner, tr(self._language(owner), 'dialog.audio_speaker_set',
+                             index=index, name=value))
+        self._audio_menu(owner, draft['id'])
 
     def _persist(self, owner, draft, key, value):
         user = self.store.get_user(owner)
@@ -270,7 +382,13 @@ class Dialog:
             self._send(owner, tr(self._language(owner), 'dialog.finish_waiting'))
             return
         state.pop('finish_requested', None)
+        state.pop('audio_prompt', None)
         self.store.update_draft(owner, draft_id, ui_state=state)
+        draft = self.store.get_draft(draft_id, owner)
+        if not self._audio_ready(draft):
+            # Несколько дорожек без выбора не доходят до сводки и оплаты.
+            self._audio_menu(owner, draft_id)
+            return
         self._summary(owner, draft_id)
 
     def import_finished(self, owner, draft_id, result, message_id):
@@ -289,14 +407,28 @@ class Dialog:
             except StoreError as exc:
                 self._error(owner, exc)
         elif result.get('status') == 'imported':
+            try:
+                audio_ready = self._audio_ready(draft)
+            except StoreError:
+                audio_ready = True
+            if not audio_ready:
+                self._audio_menu(owner, draft_id)
+                return
             self._send(owner, tr(self._language(owner), 'dialog.input_ready'),
                        [[self._button(owner, 'button.files_added', 'files_added', draft_id)]],
                        reply=message_id)
 
     def _repeat_callback(self, owner, record):
         action, target = record['action'], record['target']
-        if action in ('nav', 'history', 'files_added', 'summary'):
+        if action in ('nav', 'history', 'files_added', 'summary', 'audio_done'):
             self._callback(owner, record)
+            return
+        if action in ('audio_toggle', 'audio_speaker', 'audio_clear'):
+            draft = self.store.get_draft(target, owner)
+            if draft and draft['status'] in ('collecting', 'preparing', 'ready') and not draft['close_requested']:
+                self._audio_menu(owner, target)
+            else:
+                self._main_settings(owner)
             return
         draft = self.store.get_draft(target, owner)
         if draft and draft['status'] in ('collecting', 'preparing', 'ready') and not draft['close_requested']:
@@ -325,11 +457,22 @@ class Dialog:
         chosen = self._chosen(owner, draft)
         self._validate(chosen)
         models = self._models(chosen)
+        try:
+            audio = self._audio_values(from_state(draft['ui_state']))
+        except AudioError:
+            raise StoreError('draft_incomplete') from None
         from .intake import input_signature
-        signature = input_signature(files, chosen, models)
-        snapshot = {**chosen, 'settings': chosen, 'models': models, 'version_info': deepcopy(self.core['version_info']), 'source_message_id': draft['source_message_id'], 'source_chat_id': draft['source_chat_id']}
+        signature = input_signature(files, chosen, models, audio=audio)
+        frozen_audio = {**audio, 'speakers': {str(index): name
+                                              for index, name in audio['speakers'].items()}}
+        snapshot = {**chosen, 'settings': chosen, 'models': models, 'audio': frozen_audio, 'version_info': deepcopy(self.core['version_info']), 'source_message_id': draft['source_message_id'], 'source_chat_id': draft['source_chat_id']}
         snapshot.update(source_title=work_title(self.store, draft), source_preview=work_preview(draft))
-        draft = self.store.update_draft(owner, draft_id, status='ready', settings={**draft['settings'], **chosen}, input_signature=signature, snapshot=snapshot)
+        state = dict(draft['ui_state'])
+        state.update(state_fields(audio))
+        state.pop('audio_prompt', None)
+        draft = self.store.update_draft(owner, draft_id, status='ready', ui_state=state,
+                                        settings={**draft['settings'], **chosen},
+                                        input_signature=signature, snapshot=snapshot)
         fingerprint = _digest({'signature': signature, 'snapshot': snapshot})
         return draft, files, chosen, models, fingerprint
 
@@ -346,9 +489,32 @@ class Dialog:
         for category, model in models.items():
             provider = model['provider']
             lines.append(f'{tr(lang, "setting." + category)}: {model["name"]} — {provider["name"]} ({tr(lang, "local" if model["local"] else "cloud")})')
+        audio = from_snapshot(draft['snapshot'])
+        if audio['tracks']:
+            lines.append(tr(lang, 'dialog.audio_summary', count=len(audio['selected'])))
+            for index in audio['selected']:
+                track = next(track for track in audio['tracks'] if track['index'] == index)
+                lines.append(tr(lang, 'dialog.audio_summary_track', index=index,
+                                 title=self._audio_title(owner, track),
+                                 track_language=track['language'] or tr(lang, 'unknown'),
+                                 channels=track['channels'],
+                                 speaker=audio['speakers'].get(index) or tr(lang, 'dialog.audio_unbound')))
         info = self.core['version_info']
         lines.append(tr(lang, 'dialog.summary_privacy', version=info['version'], commit=info['commit']))
-        self._send(owner, '\n'.join(lines), [[self._button(owner, 'button.start', 'submit', draft_id, {'fingerprint': fingerprint})], [self._button(owner, 'button.settings', 'nav', draft_id, {'command': 'settings'}), self._button(owner, 'button.materials', 'materials', draft_id)]])
+        rows = [[self._button(owner, 'button.start', 'submit', draft_id, {'fingerprint': fingerprint})],
+                [self._button(owner, 'button.settings', 'nav', draft_id, {'command': 'settings'}),
+                 self._button(owner, 'button.materials', 'materials', draft_id)]]
+        for index in audio['selected']:
+            speaker = audio['speakers'].get(index)
+            label = tr(lang, 'button.audio_speaker') + f' {index}'
+            if speaker:
+                label += ': ' + self._short(speaker)
+            rows.append([self._button(owner, label, 'audio_speaker', draft_id,
+                                      {'index': index}, literal=True)])
+            if speaker:
+                rows.append([self._button(owner, 'button.audio_clear', 'audio_clear',
+                                          draft_id, {'index': index})])
+        self._send(owner, '\n'.join(lines), rows)
 
     def _validate(self, chosen):
         for key in NUMBERS:
@@ -528,8 +694,11 @@ class Dialog:
             return True
         try:
             draft = self.store.active_draft(owner)
+            audio_prompt = (draft['ui_state'] if draft else {}).get('audio_prompt')
             pending = (draft['ui_state'] if draft else self.store.get_user(owner)['settings'].get('_dialog', {})).get('number')
-            if pending:
+            if audio_prompt is not None and text:
+                self._set_speaker(owner, draft, text)
+            elif pending:
                 key = pending
                 try:
                     value = int(text) if key in ('hash_threshold', 'slides_dpi') else float(text)
@@ -633,6 +802,35 @@ class Dialog:
                 fields['status'] = 'collecting'
             self.store.update_draft(owner, target, **fields)
             self._send(owner, tr(self._language(owner), 'dialog.add_materials'), [[self._button(owner, 'button.files_added', 'files_added', target)]])
+        elif action == 'audio_toggle':
+            draft = self._target(owner, target)
+            audio = self._audio_document(draft)
+            index = payload.get('index')
+            if type(index) is not int or index not in {track['index'] for track in audio['tracks']}:
+                raise StoreError('audio_selection_invalid')
+            selected = set(audio['selected'])
+            selected.symmetric_difference_update({index})
+            speakers = {key: value for key, value in audio['speakers'].items()
+                        if key in selected}
+            self._set_audio(owner, target, {'tracks': audio['tracks'],
+                                            'selected': sorted(selected),
+                                            'speakers': speakers})
+            self._audio_menu(owner, target)
+        elif action == 'audio_speaker':
+            self._audio_prompt(owner, target, payload.get('index'))
+        elif action == 'audio_clear':
+            draft = self._target(owner, target)
+            audio = self._audio_document(draft)
+            index = payload.get('index')
+            if index not in audio['selected']:
+                raise StoreError('audio_selection_invalid')
+            audio['speakers'].pop(index, None)
+            self._set_audio(owner, target, audio)
+            self._audio_menu(owner, target)
+        elif action == 'audio_done':
+            draft = self._target(owner, target)
+            self._audio_values(self._audio_document(draft))
+            self._files_added(owner, target)
         elif action == 'media':
             draft = self._target(owner, target)
             source = draft['ui_state'].get('media_pending')

@@ -74,7 +74,7 @@ class _ReportPhase:
                                     "reason": "cloud_resources_unknown"}}
 
 
-def accepted(store, core, owner=2, signature='same', preparation=None):
+def accepted(store, core, owner=2, signature='same', preparation=None, audio=None):
     draft = store.create_draft(owner, source_message_id=123)
     tree = store.settings.storage_dir / 'jobs' / draft['id']
     (tree / 'input').mkdir(parents=True)
@@ -82,16 +82,41 @@ def accepted(store, core, owner=2, signature='same', preparation=None):
     store.add_file(owner, draft['id'], role='media', original_name='media.wav',
                    relative_path='input/media.wav', sha256='b' * 64, bytes=7,
                    duration=1, source_message_id=123)
+    snapshot = {'version_info': core['version_info'], 'models': {},
+                'settings': {'language': 'auto', 'output_language': 'en', 'fps': 1.0,
+                             'hash_threshold': 8, 'min_scene_seconds': 2.0,
+                             'slides_dpi': 150}}
+    if audio is not None:
+        snapshot['audio'] = audio
     store.update_draft(owner, draft['id'], status='ready', input_signature=signature,
-                       snapshot={'version_info': core['version_info'], 'models': {},
-                                 'settings': {'language': 'auto', 'output_language': 'en', 'fps': 1.0,
-                                              'hash_threshold': 8, 'min_scene_seconds': 2.0,
-                                              'slides_dpi': 150}})
+                       snapshot=snapshot)
     if preparation is not None:
         current = store.get_draft(draft['id'])
         store.update_draft(owner, draft['id'],
                            ui_state={**current['ui_state'], 'preparation': preparation})
     return store.enqueue(owner, draft['id'], utc_now(), force_new=False)
+
+
+def test_argv_repeats_selected_tracks_and_names_without_shell_joining(state, monkeypatch):
+    store, engine, core = state
+    tracks = [
+        {"index": 1, "title": "Зал", "language": "ru", "default": True,
+         "channels": 2, "start_time": 0.0, "offset": 0.0},
+        {"index": 4, "title": "Перевод", "language": "en", "default": False,
+         "channels": 1, "start_time": 1.0, "offset": 1.0},
+    ]
+    job = accepted(store, core, audio={"tracks": tracks, "selected": [4, 1],
+                                       "speakers": {"1": "Алиса", "4": "Боб; rm -rf /"}})
+    monkeypatch.setattr(engine_module.shutil, 'which', lambda name: '/usr/bin/uv')
+    runtime = {'python_executable': sys.executable, 'tool_env': sys.prefix,
+               'python_base_prefix': sys.base_prefix}
+    argv = engine._argv(job, {**core, 'runtime': runtime})
+    assert [argv[index + 1] for index, value in enumerate(argv)
+            if value == '--audio-track'] == ['1', '4']
+    bindings = [argv[index + 1] for index, value in enumerate(argv)
+                if value == '--track-speaker']
+    # Имя остаётся одним аргументом argv и не собирается в shell-строку.
+    assert bindings == ['1=Алиса', '4=Боб; rm -rf /']
 
 
 def test_changed_core_fails_before_any_api_or_outputs(state, monkeypatch):

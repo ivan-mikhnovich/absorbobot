@@ -14,6 +14,7 @@ from pathlib import Path
 
 import yaml
 
+from absorbobot.audio import AudioError, core_arguments
 from absorbobot.config import ConfigError, check_storage, create_work_tree, probe_core
 from absorbobot.delivery import Delivery, package_result
 from absorbobot.i18n import tr
@@ -401,6 +402,10 @@ class Engine:
         for name in ("language", "output_language", "fps", "hash_threshold",
                      "min_scene_seconds", "slides_dpi"):
             argv += ["--" + name.replace("_", "-"), str(selected[name])]
+        try:
+            argv += core_arguments(job["snapshot"].get("audio"))
+        except AudioError as exc:
+            raise StoreError(exc.code) from None
         for category, model in job["snapshot"]["models"].items():
             argv += ["--stt" if category == "stt" else "--" + category + "-model", model["name"]]
         for file in files:

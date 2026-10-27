@@ -211,6 +211,25 @@ def test_missing_selected_env_rejected_atomically(store, monkeypatch):
     assert store.quota(ALICE, NOW)["used"] == 0
 
 
+def test_multitrack_audio_requires_explicit_selection_before_enqueue(store):
+    tracks = [
+        {"index": 1, "title": "Зал", "language": "ru", "default": True,
+         "channels": 2, "start_time": 0.0, "offset": 0.0},
+        {"index": 2, "title": "Перевод", "language": "en", "default": False,
+         "channels": 1, "start_time": 0.0, "offset": 0.0},
+    ]
+    draft = ready(store, snapshot={**SNAPSHOT, "audio": {
+        "tracks": tracks, "selected": [], "speakers": {}}})
+    with error_code("audio_selection_required"):
+        store.enqueue(ALICE, draft["id"], NOW, force_new=False)
+    assert store.get_job(draft["id"]) is None
+    store.update_draft(ALICE, draft["id"], snapshot={**SNAPSHOT, "audio": {
+        "tracks": tracks, "selected": [2], "speakers": {"2": "Боб"}}})
+    job = store.enqueue(ALICE, draft["id"], NOW, force_new=False)
+    assert job["snapshot"]["audio"]["selected"] == [2]
+    assert job["snapshot"]["audio"]["speakers"] == {"2": "Боб"}
+
+
 def test_snapshot_is_independent_from_draft_and_last_user_preferences(store):
     job = enqueue(store)
     store.update_user(ALICE, settings={"fps": 99}, language="ru", output_language_override="en")

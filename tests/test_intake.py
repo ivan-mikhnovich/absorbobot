@@ -73,6 +73,25 @@ def test_signature_ignores_removed_material_but_not_its_order_or_type():
     assert input_signature(plain, SETTINGS, MODELS) != input_signature(as_slides, SETTINGS, MODELS)
 
 
+def test_signature_changes_with_audio_selection_and_binding():
+    files = [entry("media", MEDIA, "input/a.m4a")]
+    tracks = [
+        {"index": 1, "title": "Зал", "language": "ru", "default": True,
+         "channels": 2, "start_time": 0.0, "offset": 0.0},
+        {"index": 4, "title": "Перевод", "language": "en", "default": False,
+         "channels": 1, "start_time": 1.0, "offset": 1.0},
+    ]
+    base = input_signature(files, SETTINGS, MODELS, audio={
+        "tracks": tracks, "selected": [1], "speakers": {}})
+    assert base != input_signature(files, SETTINGS, MODELS, audio={
+        "tracks": tracks, "selected": [4], "speakers": {}})
+    assert base != input_signature(files, SETTINGS, MODELS, audio={
+        "tracks": tracks, "selected": [1], "speakers": {1: "Алиса"}})
+    # Запись без обнаруженных дорожек сохраняет прежнюю подпись и готовый reuse.
+    assert input_signature(files, SETTINGS, MODELS) == input_signature(
+        files, SETTINGS, MODELS, audio={"tracks": [], "selected": [], "speakers": {}})
+
+
 @pytest.mark.parametrize("change", [
     {"language": "en"},
     {"output_language": "en"},
@@ -288,6 +307,7 @@ class FakeSandbox:
         self.fail_phase = None
         self.fail_code = "analysis_failed"
         self.blocked_phase = None
+        self.audio_tracks = None
 
     def _root(self, work_uuid):
         return self.settings.storage_dir / "jobs" / work_uuid
@@ -306,6 +326,8 @@ class FakeSandbox:
             value = {"ok": True, "relative_path": str(media.relative_to(root)), "duration": 30.0}
         elif len(argv) > 3 and argv[3] == "media":
             value = {"ok": True, "duration": 12.5, "pages": None}
+            if self.audio_tracks is not None:
+                value["audio_tracks"] = self.audio_tracks
         else:
             value = {"ok": True, "duration": None, "pages": 2}
         if phase == self.fail_phase:
@@ -373,6 +395,41 @@ def test_handle_imports_media_and_clears_pending(env):
     assert files[0]["sha256"] == hashlib.sha256(b"payload").hexdigest()
     assert files[0]["source_message_id"] == MESSAGE_ID
     assert stored["ui_state"]["pending_import_ids"] == []
+
+
+def test_handle_persists_discovered_tracks_without_preselecting_all(env):
+    store, intake, sandbox = env
+    sandbox.audio_tracks = [
+        {"index": 1, "title": "Зал", "language": "ru", "default": True,
+         "channels": 2, "start_time": 0.5, "offset": 0.0},
+        {"index": 2, "title": "Синхронный перевод", "language": "en", "default": False,
+         "channels": 1, "start_time": 0.5, "offset": 0.0},
+    ]
+    draft = store.create_draft(ALICE)
+    result = asyncio.run(intake.handle(payload(ALICE, draft["id"],
+                           document={"file_id": "f1", "file_size": 7, "file_name": "recording.mkv"})))
+    assert result["status"] == "imported"
+    state = store.get_draft(draft["id"])["ui_state"]
+    assert [track["index"] for track in state["audio_tracks"]] == [1, 2]
+    assert state["audio_tracks"][0]["title"] == "Зал"
+    # Несколько дорожек не выбираются молча: выбор делает пользователь.
+    assert state["audio_selection"] == []
+    assert state["audio_speakers"] == {}
+
+
+def test_handle_auto_selects_the_only_audio_track(env):
+    store, intake, sandbox = env
+    sandbox.audio_tracks = [
+        {"index": 0, "title": None, "language": None, "default": True,
+         "channels": 1, "start_time": 0.0, "offset": 0.0},
+    ]
+    draft = store.create_draft(ALICE)
+    result = asyncio.run(intake.handle(payload(ALICE, draft["id"],
+                           document={"file_id": "f1", "file_size": 7, "file_name": "recording.m4a"})))
+    assert result["status"] == "imported"
+    state = store.get_draft(draft["id"])["ui_state"]
+    assert state["audio_selection"] == [0]
+    assert state["audio_speakers"] == {}
 
 
 def test_handle_rejects_second_media_without_touching_state(env):

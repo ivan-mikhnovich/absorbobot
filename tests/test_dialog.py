@@ -495,3 +495,69 @@ def test_foreign_saved_result_title_does_not_disclose_source_filename(dialog, st
     source = accepted(dialog, store, BOB)
     assert work_title(store, source, viewer=ALICE) == tr('en', 'work.cached_result')
     assert work_title(store, source, viewer=BOB) == 'recording'
+
+
+TRACKS = [
+    {'index': 1, 'title': 'Зал', 'language': 'ru', 'default': True,
+     'channels': 2, 'start_time': 0.0, 'offset': 0.0},
+    {'index': 4, 'title': 'Перевод', 'language': 'en', 'default': False,
+     'channels': 1, 'start_time': 1.0, 'offset': 1.0},
+]
+
+
+def with_audio(store, draft, tracks=TRACKS, selection=(), speakers=None):
+    state = dict(store.get_draft(draft['id'], ALICE)['ui_state'])
+    state.update(audio_tracks=tracks, audio_selection=list(selection),
+                 audio_speakers=dict(speakers or {}))
+    store.update_draft(ALICE, draft['id'], ui_state=state)
+    return store.get_draft(draft['id'], ALICE)
+
+
+def test_multitrack_selection_and_speaker_binding_reach_the_job_snapshot(dialog, store):
+    draft = with_audio(store, imported(dialog, store))
+
+    click(dialog, store, 'files_added', target=draft['id'])
+    assert not tokens(store, 'submit')
+    assert 'The recording has 2 audio tracks' in texts(store)
+
+    # Устаревшее подтверждение не обходит явный выбор дорожек.
+    click(dialog, store, 'submit', target=draft['id'], payload={'fingerprint': 'stale'})
+    assert store.get_job(draft['id']) is None
+
+    click(dialog, store, 'audio_toggle', target=draft['id'], payload={'index': 4})
+    assert store.get_draft(draft['id'])['ui_state']['audio_selection'] == [4]
+    click(dialog, store, 'audio_speaker', target=draft['id'], payload={'index': 4})
+    dialog.handle_message(message(text='Alice'))
+    assert store.get_draft(draft['id'])['ui_state']['audio_speakers'] == {'4': 'Alice'}
+    click(dialog, store, 'audio_speaker', target=draft['id'], payload={'index': 1})
+
+    click(dialog, store, 'audio_done', target=draft['id'])
+    assert tokens(store, 'submit')
+    assert 'Alice' in texts(store)
+    draft = store.get_draft(draft['id'])
+    assert draft['snapshot']['audio']['selected'] == [4]
+    assert draft['snapshot']['audio']['speakers'] == {'4': 'Alice'}
+
+    dialog.handle_callback(callback(tokens(store, 'submit')[-1]))
+    snapshot = store.get_job(draft['id'])['snapshot']['audio']
+    assert snapshot['selected'] == [4]
+    assert snapshot['speakers'] == {'4': 'Alice'}
+
+
+def test_single_track_is_selected_automatically_without_a_menu(dialog, store):
+    draft = with_audio(store, imported(dialog, store), tracks=TRACKS[:1], selection=())
+    click(dialog, store, 'files_added', target=draft['id'])
+    assert tokens(store, 'submit')
+    assert 'The recording has 2 audio tracks' not in texts(store)
+    assert store.get_draft(draft['id'])['snapshot']['audio']['selected'] == [1]
+    dialog.handle_callback(callback(tokens(store, 'submit')[-1]))
+    assert store.get_job(draft['id'])['snapshot']['audio']['selected'] == [1]
+
+
+def test_deselecting_the_last_track_requires_a_new_choice(dialog, store):
+    draft = with_audio(store, imported(dialog, store), selection=(1,))
+    click(dialog, store, 'audio_toggle', target=draft['id'], payload={'index': 1})
+    assert store.get_draft(draft['id'])['ui_state']['audio_selection'] == []
+    click(dialog, store, 'audio_done', target=draft['id'])
+    assert not tokens(store, 'submit')
+    assert tr('en', 'error.audio_selection_required') in texts(store)

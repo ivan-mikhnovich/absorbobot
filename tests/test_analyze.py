@@ -7,11 +7,49 @@ import subprocess
 
 import pytest
 
-from absorbobot.workers.analyze import extract_preview
+from absorbobot.workers.analyze import AnalysisError, audio_tracks, extract_preview, media_metadata
 
 
 FFMPEG = shutil.which("ffmpeg")
 PREVIEW_MAX_BYTES = 262144
+
+
+def test_audio_tracks_keep_absolute_indexes_and_start_offsets():
+    info = {
+        "format": {"duration": "120.0", "start_time": "0.5"},
+        "streams": [
+            {"index": 0, "codec_type": "video"},
+            {"index": 3, "codec_type": "audio", "channels": 2, "start_time": "1.0",
+             "tags": {"title": "  Зал\n", "language": "ru"},
+             "disposition": {"default": 1}},
+            {"index": 4, "codec_type": "audio", "channels": 1, "start_time": "0.25",
+             "tags": {"title": "перевод\x00", "language": "en"},
+             "disposition": {"default": 0}},
+        ],
+    }
+    tracks = audio_tracks(info)
+    assert [track["index"] for track in tracks] == [3, 4]
+    assert tracks[0]["title"] == "Зал"
+    assert tracks[0]["language"] == "ru"
+    assert tracks[0]["default"] is True
+    assert tracks[0]["channels"] == 2
+    # Смещение считается от начала контейнера, а не от абсолютного времени потока.
+    assert tracks[0]["offset"] == 0.5
+    assert tracks[1]["offset"] == -0.25
+    assert tracks[1]["title"] == "перевод"
+
+
+def test_media_metadata_includes_tracks_and_still_rejects_missing_audio():
+    info = {
+        "format": {"duration": "12.0", "start_time": "0"},
+        "streams": [{"index": 1, "codec_type": "audio", "channels": 1,
+                     "start_time": "0", "tags": {}, "disposition": {}}],
+    }
+    metadata = media_metadata(info, 60)
+    assert metadata["duration"] == 12.0
+    assert metadata["audio_tracks"][0]["index"] == 1
+    with pytest.raises(AnalysisError, match="missing_audio"):
+        media_metadata({"format": {"duration": "12.0"}, "streams": []}, 60)
 
 
 def work_root(tmp_path):

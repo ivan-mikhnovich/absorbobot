@@ -17,6 +17,7 @@ import threading
 import time
 from uuid import uuid4
 
+from .audio import AudioError, normalize_document, normalize_tracks, signature_part, state_fields
 from .config import ConfigError, check_storage, create_work_tree
 from .i18n import tr
 from .metrics import aggregate_reports
@@ -39,7 +40,8 @@ class IntakeError(ValueError):
 STAGES = ("media", "external", "telegram", "copy", "analyze")
 
 
-def input_signature(files: list[dict], settings: dict, models: dict) -> str:
+def input_signature(files: list[dict], settings: dict, models: dict,
+                    audio: dict | None = None) -> str:
     """Сравнить содержимое и обработку без владельца, путей и версии ядра."""
     active = [file for file in files if file.get("active", True) and not file.get("removed")]
     media = [file for file in active if file.get("role") == "media"]
@@ -90,6 +92,13 @@ def input_signature(files: list[dict], settings: dict, models: dict) -> str:
             materials.append({"sha256": file["sha256"], "type": kind.lower().lstrip(".")})
     content = {"media": media[0]["sha256"], "materials": materials,
                "settings": parameters, "models": selected}
+    if audio is not None:
+        try:
+            part = signature_part(audio)
+        except AudioError as exc:
+            raise ValueError(exc.code) from None
+        if part["tracks"] or part["selected"] or part["speakers"]:
+            content["audio"] = part
     canonical = json.dumps(content, sort_keys=True, separators=(",", ":"),
                            ensure_ascii=False, allow_nan=False).encode("utf-8")
     return hashlib.sha256(canonical).hexdigest()
@@ -807,6 +816,10 @@ class Intake:
                             raise IntakeError("invalid_duration")
                         if duration > self.settings.max_media_seconds:
                             raise IntakeError("media_too_long")
+                        try:
+                            tracks = normalize_tracks(data.get("audio_tracks"))
+                        except AudioError:
+                            raise IntakeError("invalid_media_metadata") from None
                         preview = _preview_reference(root, data)
                     else:
                         duration, pages = None, data.get("pages")
@@ -827,6 +840,11 @@ class Intake:
                     state["preview_relative_path"] = preview
                 else:
                     state.pop("preview_relative_path", None)
+                # Новая запись отменяет прежний выбор дорожек; одиночная выбрана сразу.
+                state.update(state_fields(normalize_document(
+                    {"tracks": tracks, "selected": [], "speakers": {}},
+                    require_selection=False)))
+                state.pop("audio_prompt", None)
             # Store остаётся исключительно в event-loop thread.
             with self.store.transaction():
                 self._limits(self.store.files(work_uuid), descriptor["role"], content["bytes"])
